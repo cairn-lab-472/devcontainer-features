@@ -1,0 +1,78 @@
+{
+	"rpackages-source-install": {
+		"image": "debian:stable-slim",
+		"features": {
+			"r-rig": {
+				"vscodeRSupport": "full",
+				"installDevTools": true,
+				"installREnv": true,
+				"installRMarkdown": true,
+				"installVscDebugger": true,
+				"installJupyterlab": true,
+				"installRadian": true
+			}
+		}
+	},
+	"latest-pandoc": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-rig": {
+				"version": "none",
+				"installRMarkdown": true,
+				"pandocVersion": "latest"
+			}
+		}
+	},
+	"os-pandoc": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-rig": {
+				"version": "none",
+				"installRMarkdown": true,
+				"pandocVersion": "os-provided"
+			}
+		}
+	},
+	"version-latest": {
+		"image": "debian:stable-slim",
+		"features": {
+			"r-rig": {
+				"version": "latest"
+			}
+		}
+	},
+	"version-specific-3": {
+		"image": "debian:stable-slim",
+		"features": {
+			"r-rig": {
+				"version": "3"
+			}
+		}
+	},
+	"version-specific-40": {
+		"image": "debian:stable-slim",
+		"features": {
+			"r-rig": {
+				"version": "4.0"
+			}
+		}
+	},
+	"install-on-devcontainer-r-ver": {
+		"image": "ghcr.io/rocker-org/devcontainer/r-ver:4",
+		"features": {
+			"r-rig": {
+				"version": "none",
+				"installJupyterlab": true
+			}
+		}
+	},
+	"python-packages-global": {
+		"image": "rocker/rstudio:4",
+		"features": {
+			"r-rig": {
+				"version": "none",
+				"installRadian": true
+			}
+		}
+	}
+}

@@ -1,0 +1,18 @@
+{
+	"miniforge-pypy3": {
+		"image": "debian:stable-slim",
+		"features": {
+			"miniforge": {
+				"version": "24.7.1-2",
+				"variant": "Miniforge-pypy3"
+			}
+		}
+	},
+	"miniforge-existing-conda": {
+		"image": "quay.io/jupyter/base-notebook",
+		"features":{
+			"miniforge": {}
+		},
+		"containerUser": "root"
+	}
+}

@@ -1,0 +1,34 @@
+{
+	"name": "Conda, Mamba (Miniforge)",
+	"id": "miniforge",
+	"version": "2.0.2",
+	"description": "Installs Conda and Mamba package manager and Python3. conda-forge set as the default (and only) channel.",
+	"documentationURL": "https://github.com/monte-cross/devcontainer-features/tree/main/src/miniforge",
+	"options": {
+		"version": {
+			"type": "string",
+			"proposals": [
+				"latest"
+			],
+			"default": "latest",
+			"description": "Select version of Miniforge."
+		},
+		"variant": {
+			"type": "string",
+			"enum": [
+				"Miniforge3",
+				"Miniforge-pypy3"
+			],
+			"default": "Miniforge3",
+			"description": "Select install CPython (3) or PyPy (-pypy3, which is deprecated and no longer available after version 24.9.0)."
+		}
+	},
+	"installsAfter": [
+		"ghcr.io/devcontainers/features/common-utils"
+	],
+	"containerEnv": {
+		"CONDA_DIR": "/opt/conda",
+		"CONDA_SCRIPT": "/opt/conda/etc/profile.d/conda.sh",
+		"PATH": "/opt/conda/bin:${PATH}"
+	}
+}

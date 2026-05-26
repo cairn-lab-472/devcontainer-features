@@ -1,0 +1,60 @@
+{
+	"r-already-installed": {
+		"image": "rocker/r-ver:4.3.0",
+		"features": {
+			"rstudio-server": {}
+		}
+	},
+	"version-tag": {
+		"image": "rocker/r-ver",
+		"features": {
+			"rstudio-server": {
+				"version": "2023.03.2+454"
+			}
+		}
+	},
+	"daily": {
+		"image": "rocker/rstudio",
+		"features": {
+			"rstudio-server": {
+				"version": "daily",
+				"allowReinstall": true
+			}
+		}
+	},
+	"skip-install": {
+		"image": "rocker/rstudio",
+		"features": {
+			"rstudio-server": {
+				"version": "daily"
+			}
+		}
+	},
+	"version-daily-specific": {
+		"image": "rocker/r-ver",
+		"features": {
+			"rstudio-server": {
+				"version": "2023.09.0-daily+310"
+			}
+		}
+	},
+	"update-prefs": {
+		"build": {
+			"dockerfile": "Dockerfile"
+		},
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages:1": {
+				"packages": "jq"
+			},
+			"rstudio-server": {}
+		}
+	},
+	"cant-update-prefs": {
+		"build": {
+			"dockerfile": "Dockerfile"
+		},
+		"features": {
+			"rstudio-server": {}
+		}
+	}
+}

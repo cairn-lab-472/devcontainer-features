@@ -1,0 +1,117 @@
+{
+	"install-cli-rlang": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-packages": {
+				"packages": "cli,rlang",
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"install-cli-rlang-ws": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-packages": {
+				"packages": "cli, rlang",
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"install-from-github": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-packages": {
+				"packages": "cli,github::r-lib/crayon,rlang",
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"install-from-r-universe": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages": {
+				"packages": "libcurl4-openssl-dev,libssl-dev,libxml2-dev"
+			},
+			"r-packages": {
+				"packages": "rversions",
+				"additionalRepositories": "rhub = 'https://r-hub.r-universe.dev', jeroen = 'https://jeroen.r-universe.dev'",
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"install-devel-pak": {
+		"image": "rocker/r-ver:4",
+		"features": {
+			"r-packages": {
+				"packages": "cli,rlang",
+				"pakVersion": "devel",
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"install-after-r-apt": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-apt": {},
+			"r-packages": {
+				"packages": "R6"
+			}
+		}
+	},
+	"pkgsysreqs-true-install-after-r-rig": {
+		"image": "mcr.microsoft.com/devcontainers/base:focal",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-rig": {},
+			"r-packages": {
+				"packages": "curl,R6",
+				"installSystemRequirements": true,
+				"cranMirror": "https://cloud.r-project.org/"
+			}
+		}
+	},
+	"pkgsysreqs-true-ubuntu-curl-R6": {
+		"image": "mcr.microsoft.com/devcontainers/base:focal",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-apt": {},
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages": {
+				"packages": "make,gcc,g++"
+			},
+			"r-packages": {
+				"packages": "curl,R6",
+				"installSystemRequirements": true
+			}
+		}
+	},
+	"pkgsysreqs-true-debian-R6": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-apt": {},
+			"r-packages": {
+				"packages": "R6",
+				"installSystemRequirements": true
+			}
+		}
+	},
+	"pkgsysreqs-true-ubuntu-R6": {
+		"image": "mcr.microsoft.com/devcontainers/base:focal",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-apt": {},
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages": {
+				"packages": "make,gcc,g++"
+			},
+			"r-packages": {
+				"packages": "R6",
+				"installSystemRequirements": true
+			}
+		}
+	},
+	"pkgsysreqs-true-centos7-curl-R6": {
+		"image": "rstudio/r-base:4.1-centos7",
+		"features": {
+			"r-packages": {
+				"packages": "curl,R6",
+				"installSystemRequirements": true
+			}
+		}
+	}
+}

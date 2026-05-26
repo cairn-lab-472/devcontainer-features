@@ -1,0 +1,58 @@
+{
+	"name": "R packages (via pak)",
+	"id": "r-packages",
+	"version": "1.1.0",
+	"description": "Installs R packages via the pak R package's function. R must be already installed.",
+	"documentationURL": "https://github.com/monte-cross/devcontainer-features/tree/main/src/r-packages",
+	"options": {
+		"packages": {
+			"type": "string",
+			"default": "",
+			"description": "Comma separated list of packages to install to pass to the `pak::pak()` function.",
+			"proposals": [
+				"",
+				"curl,R6"
+			]
+		},
+		"pakVersion": {
+			"type": "string",
+			"enum": [
+				"auto",
+				"devel",
+				"stable"
+			],
+			"default": "auto",
+			"description": "Version of pak to install. By default, the stable version is installed if needed."
+		},
+		"additionalRepositories": {
+			"type": "string",
+			"default": "",
+			"description": "String passed to the `pak::repo_add()` function.",
+			"proposals": [
+				"",
+				"rhub = 'https://r-hub.r-universe.dev', jeroen = 'https://jeroen.r-universe.dev'"
+			]
+		},
+		"installSystemRequirements": {
+			"type": "boolean",
+			"default": false,
+			"description": "Install packages' system requirements if available via `pak::pak()`. Converted to the `PKG_SYSREQS` env var during the installation."
+		},
+		"cranMirror" :{
+			"type": "string",
+			"default": "",
+			"description": "The CRAN mirror to use for installing packages. Converted to the `PKG_CRAN_MIRROR` env var if not empty."
+		},
+		"notCran":{
+			"type": "boolean",
+			"default": false,
+			"description": "The 'NOT_CRAN' environment variable that is referenced during the installation of this Feature."
+		}
+	},
+	"installsAfter": [
+		"ghcr.io/devcontainers/features/common-utils",
+		"ghcr.io/monte-cross/devcontainer-features/apt-packages",
+		"ghcr.io/monte-cross/devcontainer-features/r-apt",
+		"ghcr.io/monte-cross/devcontainer-features/r-rig"
+	]
+}

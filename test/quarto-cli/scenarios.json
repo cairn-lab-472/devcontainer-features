@@ -1,0 +1,74 @@
+{
+	"version-1.0.38": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"version": "1.0.38"
+			}
+		}
+	},
+	"version-0": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"version": "0"
+			}
+		}
+	},
+	"version-prerelease": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"version": "prerelease"
+			}
+		}
+	},
+	"tinytex": {
+		"image": "debian:stable-slim",
+		"features": {
+			"quarto-cli": {
+				"version": "1.2",
+				"installTinyTex": true
+			}
+		}
+	},
+	"tinytex_non_root": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"installTinyTex": true
+			}
+		}
+	},
+	"jupyter_quarto": {
+		"image": "jupyter/base-notebook:latest",
+		"remoteUser": "jovyan",
+		"features": {
+			"quarto-cli": {}
+		}
+	},
+	"chromium-on-debian": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"version": "1.4", // https://github.com/quarto-dev/quarto-cli/issues/10961
+				"installChromium": true
+			},
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages:1": {
+				"packages": "chromium"
+			}
+		}
+	},
+	"chromiumheadless-on-debian": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {
+				"version": "1.9",
+				"installChromium": true
+			},
+			"ghcr.io/monte-cross/devcontainer-features/apt-packages:1": {
+				"packages": "chromium"
+			}
+		}
+	}
+}

@@ -1,0 +1,38 @@
+{
+	"install-curl-nano-wget": {
+		"image": "debian:stable-slim",
+		"features": {
+			"apt-packages": {
+				"packages": "curl,nano,wget"
+			}
+		}
+	},
+	"install-curl-nano-wget-ws": {
+		"image": "debian:stable-slim",
+		"features": {
+			"apt-packages": {
+				"packages": "curl, nano, wget"
+			}
+		}
+	},
+	"only-upgrade": {
+		"image": "debian:stable-slim",
+		"features": {
+			"apt-packages": {
+				"upgradePackages": true
+			}
+		}
+	},
+	"install-r-packages": {
+		"image": "ubuntu:jammy",
+		"features": {
+			"ghcr.io/monte-cross/devcontainer-features/r-apt:latest": {},
+			"apt-packages": {
+				"packages": "r-cran-curl,r-cran-dplyr"
+			}
+		},
+		"overrideFeatureInstallOrder": [
+			"ghcr.io/monte-cross/devcontainer-features/r-apt"
+		]
+	}
+}

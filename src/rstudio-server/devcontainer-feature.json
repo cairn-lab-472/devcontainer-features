@@ -1,0 +1,36 @@
+{
+	"name": "RStudio Server",
+	"id": "rstudio-server",
+	"version": "0.3.1",
+	"description": "Installs the RStudio Server, enables to run the RStudio IDE on the browser.",
+	"documentationURL": "https://github.com/monte-cross/devcontainer-features/tree/main/src/rstudio-server",
+	"options": {
+		"version": {
+			"type": "string",
+			"proposals": [
+				"stable",
+				"daily"
+			],
+			"default": "stable",
+			"description": "Select version of the RStudio Server, if not stable."
+		},
+		"allowReinstall": {
+			"type": "boolean",
+			"default": false,
+			"description": "Reinstall in case RStudio Server is already installed."
+		},
+		"singleUser": {
+			"type": "boolean",
+			"default": true,
+			"description": "If `true`, configures as the single user mode."
+		}
+	},
+	"installsAfter": [
+		"ghcr.io/devcontainers/features/common-utils",
+		"ghcr.io/monte-cross/devcontainer-features/r-apt",
+		"ghcr.io/monte-cross/devcontainer-features/r-rig"
+	],
+	"onCreateCommand": {
+		"rstudio-settings": "/usr/local/share/rocker-devcontainer-features/rstudio-server/scripts/oncreate.sh"
+	}
+}

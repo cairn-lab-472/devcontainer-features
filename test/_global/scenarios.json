@@ -1,0 +1,45 @@
+{
+	"r-rig_quarto": {
+		"image": "ubuntu:latest",
+		"features": {
+			"r-rig": {
+				"installRMarkdown": true,
+				"installJupyterlab": true
+			},
+			"quarto-cli": {}
+		}
+	},
+	"r-apt_quarto": {
+		"image": "ubuntu:jammy",
+		"features": {
+			"r-apt": {
+				"installRMarkdown": true,
+				"installJupyterlab": true
+			},
+			"quarto-cli": {}
+		}
+	},
+	"r-apt_pandoc": {
+		"image": "ubuntu:jammy",
+		"features": {
+			"r-apt": {
+				"installRMarkdown": true
+			},
+			"pandoc": {}
+		}
+	},
+	"mamba_quarto": {
+		"image": "debian:stable-slim",
+		"features": {
+			"quarto-cli": {},
+			"miniforge": {}
+		}
+	},
+	"mamba_quarto_non_root": {
+		"image": "mcr.microsoft.com/devcontainers/base:debian",
+		"features": {
+			"quarto-cli": {},
+			"miniforge": {}
+		}
+	}
+}

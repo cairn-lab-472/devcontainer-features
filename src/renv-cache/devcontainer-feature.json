@@ -1,0 +1,28 @@
+{
+	"name": "renv cache",
+	"id": "renv-cache",
+	"version": "0.1.2",
+	"description": "Install the renv R package and set renv cache to a Docker volume. Cache is shared by all containers.",
+	"documentationURL": "https://github.com/monte-cross/devcontainer-features/tree/main/src/renv-cache",
+	"options": {},
+	"containerEnv": {
+		"RENV_PATHS_CACHE": "/renv/cache"
+	},
+	"mounts": [
+		{
+			"source": "devcontainer-renv-cache",
+			"target": "/renv/cache",
+			"type": "volume"
+		}
+	],
+	"postStartCommand": {
+		"renv-cache-setup": "/usr/local/share/rocker-devcontainer-features/renv-cache/scripts/poststart.sh"
+	},
+	"installsAfter": [
+		"ghcr.io/devcontainers/features/common-utils",
+		"ghcr.io/monte-cross/devcontainer-features/apt-packages",
+		"ghcr.io/monte-cross/devcontainer-features/r-apt",
+		"ghcr.io/monte-cross/devcontainer-features/r-packages",
+		"ghcr.io/monte-cross/devcontainer-features/r-rig"
+	]
+}
