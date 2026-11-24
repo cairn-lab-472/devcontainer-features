@@ -33,14 +33,14 @@ trap '__on_exit_proxy $?' EXIT
 # ============ SECTION 01 constant declarations ============
 readonly NS="janus"
 readonly VERSION="1.0"
-readonly WORKDIR="/etc/janus"
-readonly WEBROOT="/var/lib/janus/web"
+readonly WORKDIR="${JANUS_WORKDIR:-/etc/janus}"
+readonly WEBROOT="${JANUS_WEBROOT:-/var/lib/janus/web}"
 readonly BACKUP_DIR="/var/lib/janus/backups"
-readonly TOOLS_DIR="/etc/janus/tools"
-readonly STATE_FILE="/etc/janus/state.json"
-readonly STATE_LOCK="/var/run/janus-state.lock"
+readonly TOOLS_DIR="${WORKDIR}/tools"
+readonly STATE_FILE="${JANUS_STATE_FILE:-${WORKDIR}/state.json}"
+readonly STATE_LOCK="${JANUS_STATE_LOCK:-/var/run/janus-state.lock}"
 readonly CLI_PATH="/usr/local/bin/janus"
-readonly INSTALL_SH_DEST="/etc/janus/install.sh"
+readonly INSTALL_SH_DEST="${WORKDIR}/install.sh"
 
 readonly CERT_DIR="/etc/janus/cert"
 readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
@@ -59,8 +59,10 @@ readonly CFD_TOKEN_FILE="${CFD_DIR}/token"
 readonly CFD_CONFIG_FILE="${CFD_DIR}/config.yml"
 readonly CFD_BIN="/usr/local/bin/cloudflared"
 
-readonly CF_TOKEN_FILE="/etc/janus/cf_token"
-readonly SNI_EXTRA_FILE="/etc/janus/sni-extra.txt"
+readonly CF_TOKEN_FILE="${WORKDIR}/cf_token"
+readonly SNI_EXTRA_FILE="${JANUS_SNI_EXTRA_FILE:-${WORKDIR}/sni-extra.txt}"
+readonly SNI_DENY_FILE="${JANUS_SNI_DENY_FILE:-${WORKDIR}/sni.deny}"
+readonly SNI_NEIGHBOR_FILE="${JANUS_SNI_NEIGHBOR_FILE:-${WORKDIR}/sni-neighbor-list.txt}"
 readonly CFST_BIN="${TOOLS_DIR}/CloudflareST"
 readonly CFST_RESULT_FILE="${TOOLS_DIR}/cfst-result.csv"
 readonly CFST_IP_FILE="${TOOLS_DIR}/ip.txt"
@@ -279,7 +281,8 @@ __state_defaults() {
   "reality_sni": "www.cisco.com",
   "last_known_good_sni": "",
   "sni_override": null,
-  "sni_auto_rotate": true,
+  "sni_mode": "neighbor",
+  "sni_neighbor_seq_fails": 0,
   "sni_dry_run": false,
   "sni_grace_server_names": [],
   "sni_history": {},
@@ -324,7 +327,7 @@ loadState() {
   mkdir -p "$WORKDIR"
   local state_dir; state_dir=$(dirname "$STATE_FILE")
   (
-    flock 9
+    have flock && flock 9 || true
     local tmp defaults current merged
     if [[ ! -f "$STATE_FILE" ]]; then
       tmp=$(mktemp "${state_dir}/.state.XXXXXX") || exit 1
@@ -439,6 +442,7 @@ stateEnsureProtocolSecrets() {
   v=$(stateGet shadowtls_password); [[ -n "$v" ]] || stateSet shadowtls_password "$(randUrlsafe 24)"
   v=$(stateGet shadowtls_ss_method); [[ -n "$v" ]] || stateSet shadowtls_ss_method "2022-blake3-aes-128-gcm"
   v=$(stateGet shadowtls_ss_password); [[ -n "$v" ]] || stateSet shadowtls_ss_password "$(randB64 16)"
+  v=$(stateGet sub_rule_mode); [[ -n "$v" ]] || stateSet sub_rule_mode "geosite"
 }
 
 # requireState: require a non-empty state field; die on failure
@@ -456,7 +460,7 @@ __state_lock_run() {
   # Cleanup trap inside the subshell: if jq or mv fails, no .state.XXXXXX file is left in $state_dir.
   (
     trap 'rm -f "$tmp"' EXIT
-    flock 9
+    have flock && flock 9 || true
     if "$@" > "$tmp"; then
       mv "$tmp" "$STATE_FILE"
     else
@@ -965,6 +969,21 @@ __download() {
     || die "download failed: $url"
 }
 
+# --- Upstream Policy Shift & Breaking Changes Notice ---
+# 1. Strategic Pivot (July 2026, Issue #6121 / TG t.me/projectXtls/3373):
+#    Upstream maintainer (RPRX) deprecated GFW-specific optimizations, shifting
+#    focus toward Russian TSPU and Iranian censorship environments.
+# 2. Commit 8cdf7bf9 (v26.9.8 / v26.9.9):
+#    Enforces mandatory X25519MLKEM768 post-quantum KeyShare before X25519 in
+#    ClientHello to mirror Chrome 124+ against TSPU active probing. Clients
+#    lacking PQ extension are rejected and fallen back to dest (sing-box #4520,
+#    Mihomo #3193). Safe baseline without PQ enforcement: v26.7.28.
+# 3. Commit af7eb68 (v26.7.11):
+#    Introduced minClientVer checking via SessionId AEAD plaintext (bytes 0..2).
+#    Clients below minClientVer are dropped silently. Safe baseline: v26.6.27.
+# 4. Client Requirement:
+#    Connecting clients must enable PQ KeyShare (e.g., Mihomo
+#    support-x25519mlkem768: true) or server must remain at/below v26.7.28.
 installXray() {
   JANUS_INSTALL_CHANGED=0
   local arch; arch=$(hostArch)
@@ -1379,8 +1398,116 @@ upgradeSelf() {
 }
 
 # ============ SECTION 10 Reality SNI probing and rotation ============
+# Unified denylist management
+sniDenyInit() {
+  local dir; dir=$(dirname "$SNI_DENY_FILE")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+  [[ -f "$SNI_DENY_FILE" ]] || touch "$SNI_DENY_FILE"
+  local defaults=(
+    "apple.com"
+    "*.apple.com"
+    "icloud.com"
+    "*.icloud.com"
+    "www.zoom.us"
+  )
+  local d
+  for d in "${defaults[@]}"; do
+    if ! grep -qxF "$d" "$SNI_DENY_FILE" 2>/dev/null; then
+      printf '%s\n' "$d" >> "$SNI_DENY_FILE"
+    fi
+  done
+}
+
+sniDenyList() {
+  sniDenyInit
+  [[ -r "$SNI_DENY_FILE" ]] || return 0
+  awk '
+    {
+      line = tolower($0)
+      sub(/#.*/, "", line)
+      gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", line)
+      if (line == "") next
+      if (line ~ /^\*\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/ ||
+          line ~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/) {
+        if (!seen[line]++) print line
+      }
+    }
+  ' "$SNI_DENY_FILE"
+}
+
+sniDenyMatch() {
+  local host="${1:-}"
+  [[ -n "$host" ]] || return 1
+  host=$(tr '[:upper:]' '[:lower:]' <<<"$host" | tr -d '[:space:]')
+  local rule
+  while IFS= read -r rule; do
+    [[ -z "$rule" ]] && continue
+    if [[ "$rule" == \*\.* ]]; then
+      local suffix="${rule#\*.}"
+      if [[ "$host" == *."$suffix" ]]; then
+        return 0
+      fi
+    else
+      if [[ "$host" == "$rule" ]]; then
+        return 0
+      fi
+    fi
+  done < <(sniDenyList)
+  return 1
+}
+
+sniDenyAppend() {
+  local domain="${1:-}"
+  [[ -n "$domain" ]] || return 1
+  domain=$(tr '[:upper:]' '[:lower:]' <<<"$domain" | tr -d '[:space:]')
+  sniDenyInit
+  if ! grep -qxF "$domain" "$SNI_DENY_FILE" 2>/dev/null; then
+    printf '%s\n' "$domain" >> "$SNI_DENY_FILE"
+    log "Appended $domain to denylist: $SNI_DENY_FILE"
+  fi
+}
+
+sniDenyFilter() {
+  sniDenyInit
+  awk -v deny_file="$SNI_DENY_FILE" '
+    BEGIN {
+      if (deny_file != "") {
+        while ((getline line < deny_file) > 0) {
+          sub(/#.*/, "", line)
+          gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", line)
+          line = tolower(line)
+          if (line == "") continue
+          if (line ~ /^\*\./) {
+            sub(/^\*\./, "", line)
+            if (line != "") wildcards[line] = 1
+          } else if (line ~ /^[a-z0-9]/) {
+            exact[line] = 1
+          }
+        }
+        close(deny_file)
+      }
+    }
+    {
+      target = (NF >= 2 ? $2 : $1)
+      target = tolower(target)
+      if (target in exact) next
+      denied = 0
+      for (w in wildcards) {
+        dot_w = "." w
+        len_dot_w = length(dot_w)
+        if (length(target) >= len_dot_w && substr(target, length(target) - len_dot_w + 1) == dot_w) {
+          denied = 1
+          break
+        }
+      }
+      if (denied) next
+      print
+    }
+  '
+}
+
 # curated embedded SNI dictionary
-# selection criteria: TLS1.3 + h2 + stable major sites + global anycast; 
+# selection criteria: TLS1.3 + h2 + stable major sites + global anycast;
 # X25519MLKEM768/ML-DSA/cert_chain_bytes used only as positive scoring signals, not as hard filters.
 sniDictBuiltin() {
   cat <<'EOF'
@@ -1416,7 +1543,6 @@ www.t-mobile.com
 www.verizon.com
 www.salesforce.com
 www.shopify.com
-www.zoom.us
 EOF
 }
 
@@ -1457,20 +1583,20 @@ sniNormalizeList() {
 }
 
 sniReadExtra() {
-  [[ -r "$SNI_EXTRA_FILE" ]] && sniNormalizeList < "$SNI_EXTRA_FILE" || true
+  [[ -r "$SNI_EXTRA_FILE" ]] && sniNormalizeList < "$SNI_EXTRA_FILE" | sniDenyFilter || true
 }
 
 sniBuildCandidates() {
   local ranking
-  ranking=$(sniFromCfRadar | sniNormalizeList | head -n 120 || true)
+  ranking=$(sniFromCfRadar | sniNormalizeList | sniDenyFilter | head -n 120 || true)
   if [[ -z "$ranking" ]]; then
-    ranking=$(sniFromTranco | sniNormalizeList | head -n 120 || true)
+    ranking=$(sniFromTranco | sniNormalizeList | sniDenyFilter | head -n 120 || true)
   fi
   {
     sniDictBuiltin | sniNormalizeList | awk '{print "A "$0}'
     printf '%s\n' "$ranking" | awk 'NF{print "B "$0}'
     sniReadExtra | awk '{print "D "$0}'
-  } | awk '!seen[$2]++{print; if (++n >= 300) exit}'
+  } | sniDenyFilter | awk '!seen[$2]++{print; if (++n >= 300) exit}'
 }
 
 sniScannerExtractDomains() {
@@ -1566,12 +1692,38 @@ sniLocalProbe() {
     host=$(awk '{print $2}' <<<"$line")
     [[ -z "$host" ]] && return 0
     local start end
-    start=$(date +%s%3N)
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      local s1=${EPOCHREALTIME%.*} us1=${EPOCHREALTIME#*.}
+      us1="${us1}000000"
+      start="${s1}${us1:0:3}"
+    else
+      local raw1; raw1=$(date +%s%N 2>/dev/null || true)
+      if [[ "$raw1" =~ ^([0-9]{10})([0-9]{9})$ ]]; then
+        start="${BASH_REMATCH[1]}${BASH_REMATCH[2]:0:3}"
+      else
+        start="$(date +%s 2>/dev/null || printf '0')000"
+      fi
+    fi
     local out
     out=$(timeout 6 openssl s_client -connect "${host}:443" -servername "$host" \
             -verify_hostname "$host" -alpn h2 -tls1_3 </dev/null 2>&1 | tr -d '\000' || true)
-    end=$(date +%s%3N)
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      local s2=${EPOCHREALTIME%.*} us2=${EPOCHREALTIME#*.}
+      us2="${us2}000000"
+      end="${s2}${us2:0:3}"
+    else
+      local raw2; raw2=$(date +%s%N 2>/dev/null || true)
+      if [[ "$raw2" =~ ^([0-9]{10})([0-9]{9})$ ]]; then
+        end="${BASH_REMATCH[1]}${BASH_REMATCH[2]:0:3}"
+      else
+        end="$(date +%s 2>/dev/null || printf '0')000"
+      fi
+    fi
     rtt=$((end-start))
+    # Reject invalid RTT values before scoring
+    if [[ ! "$rtt" =~ ^[0-9]+$ ]] || (( rtt <= 0 || rtt > 10000 )); then
+      return 0
+    fi
     grep -Eq "New, TLSv1\.3|Protocol version: TLSv1\.3|Protocol: TLSv1\.3" <<<"$out" || return 0
     grep -q "ALPN protocol: h2" <<<"$out" || return 0
     grep -q "Verify return code: 0" <<<"$out" || return 0
@@ -1611,6 +1763,14 @@ sniScore() {
   # Use explicit IFS=' ': the script-level IFS=$'\n\t' would make read put the whole row into $src.
   while IFS=' ' read -r src host rtt cert _; do
     [[ -n "${src:-}" && -n "${host:-}" ]] || continue
+    # Reject invalid RTT values before scoring
+    if [[ ! "$rtt" =~ ^[0-9]+$ ]] || (( rtt <= 0 || rtt > 10000 )); then
+      continue
+    fi
+    # Reject denylist candidates before scoring
+    if sniDenyMatch "$host"; then
+      continue
+    fi
     hist=$(sniHistoryRate "$host")
     awk -v src="$src" -v host="$host" -v rtt="$rtt" -v cert="$cert" -v hist="$hist" '
       BEGIN {
@@ -1623,13 +1783,51 @@ sniScore() {
   done | sort -rn
 }
 
-# sniApply: <candidate>; write state after grace validation; return non-zero on failure
-sniApply() {
+# Unified SNI preflight components
+__sni_check_dns() {
+  local domain=$1
+  if have dig; then
+    timeout 5 dig +short +time=2 +tries=1 "$domain" 2>/dev/null | grep -Eq '^[0-9a-fA-F:.]+$' && return 0
+  fi
+  if have getent; then
+    timeout 5 getent ahosts "$domain" 2>/dev/null | grep -q "$domain" && return 0
+  fi
+  if have nslookup; then
+    timeout 5 nslookup "$domain" 2>/dev/null | grep -Eq "Address: [0-9a-fA-F:.]+" && return 0
+  fi
+  if have curl; then
+    timeout 5 curl -sI --max-time 3 "https://${domain}" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+__sni_check_tcp() {
+  local domain=$1
+  if have nc; then
+    timeout 5 nc -z -w 3 "$domain" 443 2>/dev/null && return 0
+  fi
+  timeout 5 bash -c "true <> /dev/tcp/${domain}/443" 2>/dev/null && return 0
+  return 1
+}
+
+__sni_check_tls_cert() {
+  local domain=$1
+  local openssl_out
+  openssl_out=$(timeout 6 openssl s_client -connect "${domain}:443" -servername "$domain" \
+                  -verify_hostname "$domain" -alpn h2 -tls1_3 </dev/null 2>&1 | tr -d '\000' || true)
+  grep -Eq "New, TLSv1\.3|Protocol version: TLSv1\.3|Protocol: TLSv1\.3" <<<"$openssl_out" || return 1
+  grep -q "ALPN protocol: h2" <<<"$openssl_out" || return 1
+  grep -q "Verify return code: 0" <<<"$openssl_out" || return 1
+  return 0
+}
+
+__sni_check_xray_config() {
   local cand=$1
+  [[ -x "$XRAY_BIN" ]] || return 0
   local privkey pubkey shortid uuid
   privkey=$(stateGet reality_privkey); pubkey=$(stateGet reality_pubkey)
   shortid=$(stateGet reality_shortid); uuid=$(stateGet uuid)
-  [[ -n "$privkey" && -n "$pubkey" && -n "$shortid" && -n "$uuid" ]] || die "Reality keys/UUID are missing"
+  [[ -n "$privkey" && -n "$pubkey" && -n "$shortid" && -n "$uuid" ]] || return 0
 
   local old_sni; old_sni=$(stateGet reality_sni)
   local server_names
@@ -1654,10 +1852,209 @@ sniApply() {
 
   if ! "$XRAY_BIN" run -test -c "$test_cfg" >/dev/null 2>&1; then
     rm -f "$test_cfg"
-    sniHistoryUpdate "$cand" fail || true
     return 1
   fi
   rm -f "$test_cfg"
+  return 0
+}
+
+sniRealityHandshakeProbe() {
+  local cand=$1
+  if [[ "${JANUS_MOCK_PREFLIGHT:-0}" == "1" ]]; then
+    return 0
+  fi
+  [[ -x "$XRAY_BIN" ]] || return 0
+
+  local privkey pubkey shortid uuid
+  privkey=$(stateGet reality_privkey); pubkey=$(stateGet reality_pubkey)
+  shortid=$(stateGet reality_shortid); uuid=$(stateGet uuid)
+  [[ -n "$privkey" && -n "$pubkey" && -n "$shortid" && -n "$uuid" ]] || return 0
+
+  local srv_port cli_port attempts=0
+  srv_port=$(( RANDOM % 10000 + 25000 ))
+  cli_port=$(( srv_port + 1 ))
+  while { (echo > /dev/tcp/127.0.0.1/"$srv_port") 2>/dev/null || (echo > /dev/tcp/127.0.0.1/"$cli_port") 2>/dev/null; } && (( attempts++ < 30 )); do
+    srv_port=$(( RANDOM % 10000 + 25000 ))
+    cli_port=$(( srv_port + 1 ))
+  done
+
+  local tmp_dir tmp_cfg tmp_log
+  tmp_dir=$(mktemp -d) || return 1
+  tmp_cfg="${tmp_dir}/xray_test.json"
+  tmp_log="${tmp_dir}/xray_test.log"
+
+  jq -n \
+    --arg srv_port "$srv_port" \
+    --arg cli_port "$cli_port" \
+    --arg cand "$cand" \
+    --arg priv "$privkey" \
+    --arg pub "$pubkey" \
+    --arg sid "$shortid" \
+    --arg uuid "$uuid" '
+  {
+    log: { loglevel: "warning" },
+    inbounds: [
+      {
+        tag: "reality-srv",
+        listen: "127.0.0.1",
+        port: ($srv_port | tonumber),
+        protocol: "vless",
+        settings: {
+          clients: [{ id: $uuid, flow: "xtls-rprx-vision" }],
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "tcp",
+          security: "reality",
+          realitySettings: {
+            target: ($cand + ":443"),
+            serverNames: [$cand],
+            privateKey: $priv,
+            shortIds: [$sid]
+          }
+        }
+      },
+      {
+        tag: "socks-cli",
+        listen: "127.0.0.1",
+        port: ($cli_port | tonumber),
+        protocol: "socks",
+        settings: { auth: "noauth", udp: false }
+      }
+    ],
+    outbounds: [
+      {
+        tag: "direct",
+        protocol: "freedom"
+      },
+      {
+        tag: "reality-out",
+        protocol: "vless",
+        settings: {
+          vnext: [{
+            address: "127.0.0.1",
+            port: ($srv_port | tonumber),
+            users: [{ id: $uuid, flow: "xtls-rprx-vision", encryption: "none" }]
+          }]
+        },
+        streamSettings: {
+          network: "tcp",
+          security: "reality",
+          realitySettings: {
+            serverName: $cand,
+            fingerprint: "chrome",
+            publicKey: $pub,
+            shortId: $sid
+          }
+        }
+      }
+    ],
+    routing: {
+      rules: [
+        { type: "field", inboundTag: ["socks-cli"], outboundTag: "reality-out" },
+        { type: "field", inboundTag: ["reality-srv"], outboundTag: "direct" }
+      ]
+    }
+  }' > "$tmp_cfg"
+
+  local xray_pid
+  "$XRAY_BIN" run -c "$tmp_cfg" > "$tmp_log" 2>&1 &
+  xray_pid=$!
+
+  sleep 1
+  if ! kill -0 "$xray_pid" 2>/dev/null; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  local probe_ok=1
+  if have curl; then
+    if timeout 12 curl -k -s -o /dev/null -I --socks5-hostname "127.0.0.1:${cli_port}" --max-time 10 "https://${cand}" 2>/dev/null; then
+      probe_ok=0
+    fi
+  else
+    probe_ok=0
+  fi
+
+  if grep -Eqi "REALITY: (fallback to|processed invalid connection|rejected|received real certificate)" "$tmp_log" 2>/dev/null; then
+    probe_ok=1
+  fi
+
+  kill -9 "$xray_pid" 2>/dev/null || true
+  wait "$xray_pid" 2>/dev/null || true
+  rm -rf "$tmp_dir"
+  return "$probe_ok"
+}
+
+sniPreflightDomain() {
+  local domain="${1:-}"
+  [[ -n "$domain" ]] || return 1
+  domain=$(tr '[:upper:]' '[:lower:]' <<<"$domain" | tr -d '[:space:]')
+
+  if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+    warn "Preflight: invalid domain format: $domain"
+    return 1
+  fi
+  if sniDenyMatch "$domain"; then
+    warn "Preflight: $domain is in denylist ($SNI_DENY_FILE)"
+    return 1
+  fi
+
+  if [[ "${JANUS_MOCK_PREFLIGHT:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  if ! __sni_check_dns "$domain"; then
+    warn "Preflight: DNS resolution failed for $domain"
+    return 1
+  fi
+
+  if ! __sni_check_tcp "$domain"; then
+    warn "Preflight: TCP 443 connection failed for $domain"
+    return 1
+  fi
+
+  if ! __sni_check_tls_cert "$domain"; then
+    warn "Preflight: TLS 1.3 / ALPN h2 / cert hostname verification failed for $domain"
+    return 1
+  fi
+
+  if ! __sni_check_xray_config "$domain"; then
+    warn "Preflight: Xray config test failed for $domain"
+    return 1
+  fi
+
+  if ! sniRealityHandshakeProbe "$domain"; then
+    warn "Preflight: Reality synthetic handshake probe failed for $domain"
+    return 1
+  fi
+
+  return 0
+}
+
+# sniApply: <candidate>; write state after unified preflight validation; return non-zero on failure
+sniApply() {
+  local cand=$1
+  [[ -n "$cand" ]] || return 1
+  cand=$(tr '[:upper:]' '[:lower:]' <<<"$cand" | tr -d '[:space:]')
+
+  if ! sniPreflightDomain "$cand"; then
+    sniHistoryUpdate "$cand" fail || true
+    return 1
+  fi
+
+  local privkey pubkey shortid uuid
+  privkey=$(stateGet reality_privkey); pubkey=$(stateGet reality_pubkey)
+  shortid=$(stateGet reality_shortid); uuid=$(stateGet uuid)
+  [[ -n "$privkey" && -n "$pubkey" && -n "$shortid" && -n "$uuid" ]] || die "Reality keys/UUID are missing"
+
+  local old_sni; old_sni=$(stateGet reality_sni)
+  local server_names
+  if [[ -n "$old_sni" && "$old_sni" != "$cand" ]]; then
+    server_names=$(jq -n --arg a "$cand" --arg b "$old_sni" '[$a,$b]')
+  else
+    server_names=$(jq -n --arg a "$cand" '[$a]')
+  fi
 
   stateSet reality_sni "$cand"
   # Keep the previous SNI as the old backup during the grace period.
@@ -1672,52 +2069,616 @@ sniApply() {
   return 0
 }
 
-sniPickBest() {
-  banner "Reality SNI candidate probing"
-  loadState
+readonly SNI_NEIGHBOR_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+export SNI_NEIGHBOR_UA
 
-  # override priority 1: environment variables
-  if [[ -n "${JANUS_SNI_OVERRIDE:-}" ]]; then
-    log "Using environment variable JANUS_SNI_OVERRIDE=${JANUS_SNI_OVERRIDE}"
-    if [[ "${JANUS_SNI_DRY_RUN:-0}" == "1" ]]; then
-      log "DRY_RUN: skip grace validation"
-      return 0
+sniModeGet() {
+  local m; m=$(stateGet sni_mode)
+  case "$m" in
+    global) printf 'global' ;;
+    *) printf 'neighbor' ;;
+  esac
+}
+
+__sni_neighbor_seq_fails_get() {
+  local n; n=$(stateGet sni_neighbor_seq_fails)
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$n"
+  else
+    printf '0'
+  fi
+}
+
+__now_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local s=${EPOCHREALTIME%%[.,]*} us=${EPOCHREALTIME#*[.,]}
+    us="${us}000000"
+    printf '%s%s' "$s" "${us:0:3}"
+  else
+    local raw; raw=$(date +%s%N 2>/dev/null || true)
+    if [[ "$raw" =~ ^([0-9]{10})([0-9]{9})$ ]]; then
+      printf '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]:0:3}"
+    else
+      printf '%s000' "$(date +%s 2>/dev/null || printf '0')"
     fi
-    sniApply "$JANUS_SNI_OVERRIDE" || die "JANUS_SNI_OVERRIDE grace validation failed"
+  fi
+}
+
+__sni_is_valid_ipv4() {
+  local ip="${1:-}"
+  [[ "$ip" =~ ^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$ ]]
+}
+
+__sni_neighbor_ipv4() {
+  local ip="${JANUS_SNI_NEIGHBOR_IPV4:-}"
+  if [[ -z "$ip" ]]; then
+    ip=$(stateGet ipv4)
+  fi
+  if [[ -z "$ip" && "${JANUS_SNI_NEIGHBOR_NO_DETECT:-0}" != "1" ]]; then
+    detectPublicIp >/dev/null 2>&1 || true
+    ip=$(stateGet ipv4)
+  fi
+  ip=$(tr -d '[:space:]' <<<"$ip")
+  if __sni_is_valid_ipv4 "$ip"; then
+    printf '%s' "$ip"
     return 0
   fi
+  return 1
+}
 
-  # override priority 2: state.sni_override
-  local ov; ov=$(stateGet sni_override)
-  if [[ -n "$ov" && "$ov" != "null" ]]; then
-    log "Using state.sni_override=${ov}"
-    if [[ "${JANUS_SNI_DRY_RUN:-0}" == "1" || "$(stateGet sni_dry_run)" == "true" ]]; then
-      log "DRY_RUN: skip grace validation"
-      return 0
-    fi
-    sniApply "$ov" || die "sni_override grace validation failed"
-    return 0
+# Tier 1: bgp.he.net CT JSON API (passive)
+__sni_neighbor_fetch_he_certs() {
+  local cidr=$1 prefix=$2
+  local url="${JANUS_NEIGHBOR_HE_API_URL:-https://bgp.he.net/certs/api/ip-search?ip=${cidr}}"
+  local resp
+  resp=$(curl -fsS --max-time 15 -A "$SNI_NEIGHBOR_UA" "$url" 2>/dev/null) || return 0
+  [[ -n "$resp" ]] || return 0
+  jq -r --arg pfx "${prefix}." '
+    .entries[]?
+    | (.ip // "") as $ip
+    | select(($ip | type) == "string" and ($ip | startswith($pfx)))
+    | .hostnames[]?
+    | select(type == "string" and length > 0)
+    | "\($ip)\t\(.)"
+  ' <<<"$resp" 2>/dev/null || true
+}
+
+# Tier 2: hackertarget reverse IP CSV API (passive)
+__sni_neighbor_fetch_hackertarget() {
+  local cidr=$1 prefix=$2
+  local url="${JANUS_NEIGHBOR_HT_API_URL:-https://api.hackertarget.com/reverseiplookup/?q=${cidr}}"
+  local resp
+  resp=$(curl -fsS --max-time 15 -A "$SNI_NEIGHBOR_UA" "$url" 2>/dev/null) || return 0
+  [[ -n "$resp" ]] || return 0
+  awk -F',' -v pfx="${prefix}." '
+    {
+      gsub(/\r/, "")
+      if (NF != 2) next
+      dom = $1; ip = $2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", dom)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+      if (dom == "" || index(ip, pfx) != 1) next
+      if (split(ip, o, ".") != 4) next
+      valid = 1
+      for (i = 1; i <= 4; i++) {
+        if (o[i] !~ /^[0-9]+$/ || o[i] + 0 > 255) { valid = 0; break }
+      }
+      if (!valid) next
+      print ip "\t" dom
+    }
+  ' <<<"$resp" || true
+}
+
+# Tier 3: bgp.he.net/net/<cidr> static #dns HTML table (passive)
+__sni_neighbor_fetch_he_dns() {
+  local cidr=$1 prefix=$2
+  local url="${JANUS_NEIGHBOR_HE_NET_URL:-https://bgp.he.net/net/${cidr}}"
+  local resp
+  resp=$(curl -fsS --max-time 15 -A "$SNI_NEIGHBOR_UA" "$url" 2>/dev/null) || return 0
+  [[ -n "$resp" ]] || return 0
+  tr '\r\n' '  ' <<<"$resp" \
+    | sed -E 's/<[tT][rR]([[:space:]>])/\n<tr\1/g' \
+    | awk -v pfx="${prefix}." '
+      {
+        line = $0
+        sub(/<\/[tT][rR]>.*/, "", line)
+        if (!match(line, /href=["'\'']\/ip\/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+["'\'']/)) next
+        ip_tok = substr(line, RSTART, RLENGTH)
+        sub(/^href=["'\'']\/ip\//, "", ip_tok)
+        sub(/["'\'']$/, "", ip_tok)
+        if (index(ip_tok, pfx) != 1) next
+        rest = line
+        while (match(rest, /href=["'\'']\/dns\/[^"'\''#?<>[:space:]]+["'\'']/)) {
+          dom = substr(rest, RSTART, RLENGTH)
+          sub(/^href=["'\'']\/dns\//, "", dom)
+          sub(/["'\'']$/, "", dom)
+          sub(/\/$/, "", dom)
+          if (dom != "") print ip_tok "\t" dom
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+    ' || true
+}
+
+# Tier 4: rapiddns.io passive subnet table (passive)
+__sni_neighbor_fetch_rapiddns() {
+  local cidr=$1 prefix=$2
+  local url="${JANUS_NEIGHBOR_RD_URL:-https://rapiddns.io/s/${cidr}?full=1}"
+  local resp
+  resp=$(curl -fsS --max-time 15 -A "$SNI_NEIGHBOR_UA" "$url" 2>/dev/null) || return 0
+  [[ -n "$resp" ]] || return 0
+  tr '\r\n' '  ' <<<"$resp" \
+    | sed -E 's/<[tT][hH][[:space:]]+scope=["'\'']row[[:space:]]*["'\'']/\n<th_row /g' \
+    | awk -v pfx="${prefix}." '
+      /^<th_row / {
+        block = $0
+        sub(/<\/[tT][rR]>.*/, "", block)
+        if (!match(block, /sameip\/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+#result/)) next
+        ip_tok = substr(block, RSTART, RLENGTH)
+        sub(/^sameip\//, "", ip_tok)
+        sub(/#result$/, "", ip_tok)
+        if (index(ip_tok, pfx) != 1) next
+        n = split(block, tds, /<[tT][dD][^>]*>/)
+        if (n < 2) next
+        dom = tds[2]
+        sub(/<\/[tT][dD]>.*/, "", dom)
+        gsub(/<[^>]*>/, "", dom)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", dom)
+        if (dom != "") print ip_tok "\t" dom
+      }
+    ' || true
+}
+
+sniFetchNeighborRaw() {
+  local cidr=$1 self_ip=$2
+  local net_ip="${cidr%/*}"
+  local prefix="${net_ip%.*}"
+  local raw=""
+
+  raw=$(__sni_neighbor_fetch_he_certs "$cidr" "$prefix")
+  if [[ -z "${raw//[[:space:]]/}" ]]; then
+    log "Tier 1 (bgp.he.net certs API) returned empty; falling back to Tier 2 (hackertarget)" >&2
+    raw=$(__sni_neighbor_fetch_hackertarget "$cidr" "$prefix")
+  fi
+  if [[ -z "${raw//[[:space:]]/}" ]]; then
+    log "Tier 2 (hackertarget) returned empty; falling back to Tier 3+4 (bgp.he.net #dns + rapiddns)" >&2
+    local raw3 raw4
+    raw3=$(__sni_neighbor_fetch_he_dns "$cidr" "$prefix")
+    raw4=$(__sni_neighbor_fetch_rapiddns "$cidr" "$prefix")
+    raw=$(printf '%s\n%s\n' "$raw3" "$raw4")
   fi
 
+  [[ -n "${raw//[[:space:]]/}" ]] || return 0
+
+  local d1 d2 d3
+  d1=$(stateGet domain); d1=${d1,,}; d1=${d1//[$' \t\r\n']/}
+  d2="${ROOT_DOMAIN:-}"; d2=${d2,,}; d2=${d2//[$' \t\r\n']/}
+  d3=$(stateGet cf_domain); d3=${d3,,}; d3=${d3//[$' \t\r\n']/}
+
+  awk -v self_ip="$self_ip" -v pfx="${prefix}." \
+      -v d1="$d1" -v d2="$d2" -v d3="$d3" '
+    function is_own(d,    arr, k, od) {
+      arr[1] = d1; arr[2] = d2; arr[3] = d3
+      for (k = 1; k <= 3; k++) {
+        od = arr[k]
+        if (od == "" || od == "null") continue
+        if (d == od) return 1
+        if (length(d) > length(od) + 1 && substr(d, length(d) - length(od)) == "." od) return 1
+      }
+      return 0
+    }
+    function emit_row(ip, dom,    key) {
+      if (is_own(dom)) return
+      if (dom !~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/) return
+      key = ip "\t" dom
+      if (!seen[key]++) print key
+    }
+    BEGIN { FS = "\t" }
+    {
+      gsub(/\r/, "")
+      if (NF < 2) next
+      ip = tolower($1); dom = tolower($2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", dom)
+      if (ip == "" || dom == "" || ip == self_ip) next
+      if (index(ip, pfx) != 1) next
+      if (split(ip, o, ".") != 4) next
+      valid_ip = 1
+      for (i = 1; i <= 4; i++) {
+        if (o[i] !~ /^[0-9]+$/ || o[i] + 0 > 255) { valid_ip = 0; break }
+      }
+      if (!valid_ip) next
+      if (is_own(dom)) next
+      if (dom !~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/) next
+      emit_row(ip, dom)
+      if (dom ~ /^[^.]+\.[^.]+$/ && dom !~ /^www\./) {
+        emit_row(ip, "www." dom)
+      }
+    }
+  ' <<<"$raw"
+}
+
+__sni_neighbor_domain_ok() {
+  local dom="${1:-}"
+  [[ -n "$dom" ]] || return 1
+  dom=${dom,,}
+  dom=${dom//$'\r'/}
+  dom="${dom#"${dom%%[![:space:]]*}"}"
+  dom="${dom%"${dom##*[![:space:]]}"}"
+  [[ "$dom" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || return 1
+  ! sniDenyMatch "$dom" || return 1
+
+  case "$dom" in
+    cloudflare.com|*.cloudflare.com|cloudflare-dns.com|www.cloudflare-cn.com) return 1 ;;
+    apple.com|*.apple.com|icloud.com|*.icloud.com) return 1 ;;
+  esac
+
+  local od
+  for od in "$(stateGet domain)" "${ROOT_DOMAIN:-}" "$(stateGet cf_domain)"; do
+    od=${od,,}
+    od=${od//[$' \t\r\n']/}
+    [[ -n "$od" && "$od" != "null" ]] || continue
+    [[ "$dom" == "$od" || "$dom" == *."$od" ]] && return 1
+  done
+
+  local dyn_re='(^|\.)(sslip\.io|nip\.io|xip\.io|duckdns\.org|ddns\.net|no-ip\.org|dynu\.net|freeddns\.org)$'
+  [[ "$dom" =~ $dyn_re ]] && return 1
+
+  local bad_lbl_re='(^|[.-])(xray|v2ray|vmess|vless|trojan|ss|ssr|hy2|hysteria|tuic|naive|proxy|sub|substore|node|panel|xui|3xui|marzban|soga|vpn|newapi|oneapi|api|admin|mail|webmail|mailadmin|pay|topup|kvm|test|ceshi|bark|memo)([.-]|$)'
+  [[ "$dom" =~ $bad_lbl_re ]] && return 1
+
+  local -a parts
+  IFS='.' read -ra parts <<< "$dom"
+  local n=${#parts[@]} sld=""
+  if (( n >= 3 )) && [[ "${parts[$((n-1))]}" =~ ^[a-z]{2}$ ]] && [[ "${parts[$((n-2))]}" =~ ^(com|net|org|gov|edu|ac|co|ne|or|me|go|gr|ad)$ ]]; then
+    sld="${parts[$((n-3))]}"
+  elif (( n >= 2 )); then
+    sld="${parts[$((n-2))]}"
+  fi
+  if (( ${#sld} >= 8 )); then
+    if [[ "$sld" =~ [bcdfghjklmnpqrstvwxz]{6,} ]] || [[ ! "$sld" =~ [aeiouy] ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+__run_with_timeout() {
+  local sec=$1 cmd=$2; shift 2
+  if [[ "$(type -t "$cmd" 2>/dev/null || true)" == "file" ]] && have timeout; then
+    timeout "$sec" "$cmd" "$@"
+  else
+    "$cmd" "$@"
+  fi
+}
+
+__sni_neighbor_resolve_a() {
+  local domain=$1
+  local out=""
+  if have dig; then
+    out=$(__run_with_timeout 5 dig +short +time=2 +tries=1 A "$domain" 2>/dev/null || true)
+  elif have getent; then
+    out=$(__run_with_timeout 5 getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  fi
+  awk '
+    {
+      gsub(/\r/, "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      if (split($0, o, ".") == 4) {
+        ok = 1
+        for (i = 1; i <= 4; i++) {
+          if (o[i] !~ /^[0-9]+$/ || o[i] + 0 > 255) { ok = 0; break }
+        }
+        if (ok && !seen[$0]++) print $0
+      }
+    }
+  ' <<<"$out"
+}
+
+__sni_neighbor_check_same_subnet_dns() {
+  local domain=$1 prefix=$2 self_ip=$3
+  [[ -n "$domain" && -n "$prefix" && -n "$self_ip" ]] || return 1
+  local ips ip count=0
+  ips=$(__sni_neighbor_resolve_a "$domain")
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    count=$((count + 1))
+    [[ "$ip" == "${prefix}."* ]] || return 1
+    [[ "$ip" != "$self_ip" ]] || return 1
+  done <<<"$ips"
+  (( count >= 1 ))
+}
+
+__sni_neighbor_probe_https() {
+  local domain=$1 prefix=$2 self_ip=$3
+  [[ -n "$domain" && -n "$prefix" && -n "$self_ip" ]] || return 1
+  domain=${domain,,}
+
+  __sni_neighbor_check_same_subnet_dns "$domain" "$prefix" "$self_ip" || return 1
+  local first_ip
+  first_ip=$(__sni_neighbor_resolve_a "$domain" | head -n 1 || true)
+  [[ -n "$first_ip" ]] || first_ip="${prefix}.0"
+
+  local start_ms end_ms rtt_ms out
+  start_ms=$(__now_ms)
+  out=$(curl -I -sS -v --max-time 5 --tlsv1.3 --http2 -A "$SNI_NEIGHBOR_UA" "https://${domain}" 2>&1 | tr -d '\r\000' || true)
+  end_ms=$(__now_ms)
+  rtt_ms=$((end_ms - start_ms))
+  if [[ ! "$rtt_ms" =~ ^-?[0-9]+$ ]]; then
+    rtt_ms=1
+  fi
+  (( rtt_ms < 1 )) && rtt_ms=1
+  (( rtt_ms <= 15000 )) || return 1
+
+  grep -q 'TLSv1\.3' <<<"$out" || return 1
+  grep -E 'ALPN' <<<"$out" | grep -Evi 'offers' | grep -Eq 'accepted.*h2|negotiated.*h2|\bh2\b' || return 1
+
+  local first_status
+  first_status=$(grep -E '^< HTTP/' <<<"$out" | head -n 1 || true)
+  [[ "$first_status" =~ ^\<\ HTTP/2\ 200([[:space:]]|$) ]] || return 1
+
+  if grep -Eiq '^< server:[[:space:]]*(gws|cloudflare|akamaighost|esf)([[:space:]]|$)' <<<"$out"; then
+    return 1
+  fi
+
+  local cert_days=30 exp_str exp_epoch now_epoch
+  exp_str=$(awk -F'expire date:[[:space:]]*' '/expire date:/{print $2; exit}' <<<"$out")
+  if [[ -n "$exp_str" ]]; then
+    exp_epoch=$(date -d "$exp_str" +%s 2>/dev/null || true)
+    now_epoch=$(date +%s 2>/dev/null || echo 0)
+    if [[ "$exp_epoch" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]] && (( now_epoch > 0 )); then
+      cert_days=$(( (exp_epoch - now_epoch) / 86400 ))
+      (( cert_days < 0 )) && cert_days=0
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$first_ip" "$domain" "$rtt_ms" "$cert_days"
+}
+
+__sni_neighbor_check_html() {
+  local domain=$1
+  [[ -n "$domain" ]] || return 1
+  local body_file html_len sample title bad_re
+  body_file=$(mktemp) || return 1
+  curl -sS --max-time 8 --tlsv1.3 --http2 --max-filesize 3145728 -A "$SNI_NEIGHBOR_UA" -o "$body_file" "https://${domain}" 2>/dev/null || true
+  html_len=$(wc -c < "$body_file" 2>/dev/null | tr -d '[:space:]' || echo 0)
+  if [[ ! "$html_len" =~ ^[0-9]+$ ]] || (( html_len < 2048 )); then
+    rm -f "$body_file"
+    return 1
+  fi
+  sample=$(head -c 65536 "$body_file" 2>/dev/null | tr '\000\r\n\t' '    ' || true)
+  rm -f "$body_file"
+  title=$(awk '
+    {
+      s = $0
+      ls = tolower(s)
+      if (match(ls, /<title[^>]*>/)) {
+        start = RSTART + RLENGTH
+        s = substr(s, start)
+        ls = substr(ls, start)
+        if (match(ls, /<\/title>/)) {
+          t = substr(s, 1, RSTART - 1)
+          gsub(/<[^>]*>/, "", t)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+          print t
+          exit
+        }
+      }
+    }
+  ' <<<"$sample")
+  [[ -n "$title" ]] || return 1
+  bad_re='mikutap|new api|one api|sub store|sub-store|shadowrocket|小火箭|苹果id|apple id|appleautopro|路飞|梯子|机场|roundcube|站点创建成功|hy2 vps|越南代理|cli proxy api'
+  if grep -Eiq "$bad_re" <<<"$title" || grep -Eiq "$bad_re" <<<"$sample"; then
+    return 1
+  fi
+  printf '%s' "$html_len"
+  return 0
+}
+
+__sni_neighbor_score() {
+  local dom=$1 rtt=$2 html_len=$3 cert_days=$4 ip_sites=$5 ip_dirty=$6
+  local s_ip s_fmt s_html s_cert s_rtt
+
+  if (( ip_dirty == 0 && ip_sites <= 1 )); then s_ip=35
+  elif (( ip_dirty == 0 && ip_sites == 2 )); then s_ip=30
+  elif (( ip_dirty == 0 && ip_sites <= 5 )); then s_ip=25
+  elif (( ip_dirty == 0 )); then s_ip=20
+  elif (( ip_dirty <= 2 )); then s_ip=15
+  else s_ip=5
+  fi
+
+  if [[ "$dom" =~ (^www\.|^)[^.]+\.(com|net|org)$ ]]; then s_fmt=25
+  elif [[ "$dom" =~ (^www\.|^)[^.]+\.(ca|io|co|dev|studio|in|jp|uk|de|cn)$ ]]; then s_fmt=20
+  elif [[ "$dom" =~ ^[^.]+\.[^.]+\.(com|net|org|ca|io|co|dev|studio|in)$ ]]; then s_fmt=16
+  else s_fmt=10
+  fi
+
+  if (( html_len >= 50000 )); then s_html=25
+  elif (( html_len >= 10000 )); then s_html=20
+  elif (( html_len >= 4000 )); then s_html=15
+  else s_html=10
+  fi
+
+  if (( cert_days >= 30 )); then s_cert=8
+  elif (( cert_days >= 14 )); then s_cert=5
+  else s_cert=2
+  fi
+
+  if (( rtt <= 50 )); then s_rtt=7
+  elif (( rtt <= 150 )); then s_rtt=5
+  elif (( rtt <= 400 )); then s_rtt=3
+  else s_rtt=1
+  fi
+
+  printf '%d' "$((s_ip + s_fmt + s_html + s_cert + s_rtt))"
+}
+
+sniBuildNeighborList() {
+  local self_ip prefix cidr raw
+  self_ip=$(__sni_neighbor_ipv4 || true)
+  if [[ -z "$self_ip" ]]; then
+    warn "Cannot determine public IPv4 for neighbor SNI discovery"
+    return 1
+  fi
+  prefix="${self_ip%.*}"
+  cidr="${prefix}.0/24"
+  log "Discovering same-subnet neighbor SNI candidates for ${cidr} (passive sources only)..."
+
+  raw=$(sniFetchNeighborRaw "$cidr" "$self_ip")
+  if [[ -z "${raw//[[:space:]]/}" ]]; then
+    warn "No raw neighbor SNI records found for ${cidr}"
+    rm -f "$SNI_NEIGHBOR_FILE"
+    return 1
+  fi
+
+  local -A ip_site_count=() ip_dirty_count=() ip_site_seen=() cand_seen=()
+  local -a step1_domains=()
+  local ip dom site_key dom_ok raw_count=0
+  while IFS=$'\t' read -r ip dom || [[ -n "${ip:-}" ]]; do
+    ip=${ip//$'\r'/}; dom=${dom//$'\r'/}
+    [[ -n "$ip" && -n "$dom" ]] || continue
+    raw_count=$((raw_count + 1))
+    site_key="${dom#www.}"
+    if [[ -z "${ip_site_seen["${ip}|${site_key}"]:-}" ]]; then
+      ip_site_seen["${ip}|${site_key}"]=1
+      ip_site_count["$ip"]=$(( ${ip_site_count["$ip"]:-0} + 1 ))
+    fi
+    dom_ok=0
+    if __sni_neighbor_domain_ok "$dom"; then
+      dom_ok=1
+    fi
+    if (( dom_ok == 0 )) || [[ "$dom" =~ (luffyid|luffyld|luffyhub|id\.store) ]]; then
+      ip_dirty_count["$ip"]=$(( ${ip_dirty_count["$ip"]:-0} + 1 ))
+    fi
+    if (( dom_ok == 1 )) && [[ -z "${cand_seen["$dom"]:-}" ]]; then
+      cand_seen["$dom"]=1
+      step1_domains+=("$dom")
+    fi
+  done <<<"$raw"
+
+  log "Neighbor raw rows: ${raw_count}, unique Step 1 candidates: ${#step1_domains[@]}"
+  if (( ${#step1_domains[@]} == 0 )); then
+    warn "No neighbor SNI candidates survived Step 1 filtering"
+    rm -f "$SNI_NEIGHBOR_FILE"
+    return 1
+  fi
+
+  export -f have __run_with_timeout __now_ms __sni_neighbor_resolve_a __sni_neighbor_check_same_subnet_dns __sni_neighbor_probe_https
+  local probed
+  probed=$(printf '%s\n' "${step1_domains[@]}" | xargs -P 8 -I{} bash -c '__sni_neighbor_probe_https "$@" || true' _ "{}" "$prefix" "$self_ip")
+  if [[ -z "${probed//[[:space:]]/}" ]]; then
+    warn "No neighbor SNI candidates passed Step 2/3 (same-subnet DNS + TLS 1.3 + ALPN h2 + HTTP/2 200)"
+    rm -f "$SNI_NEIGHBOR_FILE"
+    return 1
+  fi
+
+  local scored_rows="" rtt cert_days html_len ip_sites ip_dirty score
+  while IFS=$'\t' read -r ip dom rtt cert_days || [[ -n "${ip:-}" ]]; do
+    ip=${ip//$'\r'/}; dom=${dom//$'\r'/}
+    [[ -n "$ip" && -n "$dom" ]] || continue
+    html_len=$(__sni_neighbor_check_html "$dom" || true)
+    [[ -n "$html_len" ]] || continue
+    ip_sites="${ip_site_count["$ip"]:-1}"
+    ip_dirty="${ip_dirty_count["$ip"]:-0}"
+    score=$(__sni_neighbor_score "$dom" "$rtt" "$html_len" "$cert_days" "$ip_sites" "$ip_dirty")
+    scored_rows+="${score}"$'\t'"${dom}"$'\t'"${ip}"$'\t'"${rtt}"$'\t'"${html_len}"$'\t'"${cert_days}"$'\t'"${ip_sites}"$'\t'"${ip_dirty}"$'\n'
+  done <<<"$probed"
+
+  if [[ -z "${scored_rows//[[:space:]]/}" ]]; then
+    warn "No neighbor SNI candidates passed Step 4A (HTML compliance check)"
+    rm -f "$SNI_NEIGHBOR_FILE"
+    return 1
+  fi
+
+  local sorted_top20
+  sorted_top20=$(printf '%s' "$scored_rows" | sort -t$'\t' -k1,1nr -k2,2 | head -n 20)
+
+  local final_rows=""
+  while IFS=$'\t' read -r score dom ip rtt html_len cert_days ip_sites ip_dirty || [[ -n "${score:-}" ]]; do
+    [[ -n "$dom" ]] || continue
+    if sniPreflightDomain "$dom"; then
+      final_rows+="${dom}"$'\t'"${score}"$'\t'"${ip}"$'\t'"${rtt}"$'\t'"${html_len}"$'\t'"${cert_days}"$'\t'"${ip_sites}"$'\t'"${ip_dirty}"$'\n'
+    fi
+  done <<<"$sorted_top20"
+
+  if [[ -z "${final_rows//[[:space:]]/}" ]]; then
+    warn "No neighbor SNI candidates passed sniPreflightDomain"
+    rm -f "$SNI_NEIGHBOR_FILE"
+    return 1
+  fi
+
+  local dir tmp
+  dir=$(dirname "$SNI_NEIGHBOR_FILE")
+  mkdir -p "$dir"
+  tmp=$(mktemp "${dir}/.sni-neighbor.XXXXXX") || return 1
+  printf '%s' "$final_rows" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$SNI_NEIGHBOR_FILE" || { rm -f "$tmp"; return 1; }
+
+  local count
+  count=$(wc -l < "$SNI_NEIGHBOR_FILE" | tr -d '[:space:]')
+  ok "Built neighbor SNI list (${count} candidates): $SNI_NEIGHBOR_FILE"
+  return 0
+}
+
+__sni_neighbor_live_retest() {
+  local domain=$1 prefix=${2:-} self_ip=${3:-}
+  [[ -n "$domain" ]] || return 1
+  domain=${domain,,}
+  ! sniDenyMatch "$domain" || return 1
+  if [[ "${JANUS_MOCK_PREFLIGHT:-0}" == "1" && "${JANUS_MOCK_NEIGHBOR_LIVE_RETEST:-0}" != "1" ]]; then
+    sniPreflightDomain "$domain"
+    return $?
+  fi
+  __sni_neighbor_check_same_subnet_dns "$domain" "$prefix" "$self_ip" || return 1
+  local probe_row
+  probe_row=$(__sni_neighbor_probe_https "$domain" "$prefix" "$self_ip") || return 1
+  [[ -n "$probe_row" ]] || return 1
+  __sni_neighbor_check_html "$domain" >/dev/null || return 1
+  sniPreflightDomain "$domain" || return 1
+  return 0
+}
+
+__sni_neighbor_apply_first_from_file() {
+  [[ -s "$SNI_NEIGHBOR_FILE" ]] || return 1
+  local dom score ip rtt html_len cert_days ip_sites ip_dirty
+  while IFS=$'\t' read -r dom score ip rtt html_len cert_days ip_sites ip_dirty || [[ -n "${dom:-}" ]]; do
+    dom=${dom//$'\r'/}
+    [[ -z "$dom" || "$dom" == \#* ]] && continue
+    dom=${dom,,}
+    sniDenyMatch "$dom" && continue
+    if sniApply "$dom"; then
+      stateSetJson sni_neighbor_seq_fails 0
+      stateSet sni_last_score_summary "score=${score:-0} domain=${dom} mode=neighbor ip=${ip:--} rtt=${rtt:-0}ms html=${html_len:-0}B cert=${cert_days:-0}d ip_sites=${ip_sites:-0} ip_dirty=${ip_dirty:-0}"
+      stateSetJson alert 'null'
+      ok "Applied neighbor SNI=$dom (score=${score:-0})"
+      return 0
+    fi
+    return 1
+  done < "$SNI_NEIGHBOR_FILE"
+  return 1
+}
+
+sniPickBestGlobal() {
   log "Building candidate pool..."
   local cands; cands=$(sniBuildCandidates)
   local n; n=$(wc -l <<<"$cands")
   log "candidate count: $n"
 
   log "RealiTLScanner candidate-file validation..."
-  local verified; verified=$(printf '%s\n' "$cands" | sniVerifyCandidatesWithScanner | awk 'NF >= 2')
+  local verified; verified=$(printf '%s\n' "$cands" | sniVerifyCandidatesWithScanner | awk 'NF >= 2' | sniDenyFilter)
   local vn; vn=$(wc -l <<<"$verified")
   log "candidate count after validation: $vn"
 
   log "local concurrent openssl probing..."
-  local probed; probed=$(printf '%s\n' "$verified" | sniLocalProbe | awk 'NF >= 4')
+  local probed; probed=$(printf '%s\n' "$verified" | sniLocalProbe | awk 'NF >= 4' | sniDenyFilter)
   local scored; scored=$(printf '%s\n' "$probed" | sniScore)
 
   if [[ -z "$scored" ]]; then
     local current; current=$(stateGet reality_sni)
     warn "no candidates passed the filters; trying to keep the previous SNI=${current}"
     stateSet alert "sni_no_candidate"
-    if [[ -n "$current" && "$current" != "null" ]] && sniApply "$current"; then
+    if [[ -n "$current" && "$current" != "null" ]] && ! sniDenyMatch "$current" && sniApply "$current"; then
       warn "continuing to use the current SNI=${current}"
       return 0
     fi
@@ -1749,18 +2710,206 @@ sniPickBest() {
     fi
   done
   stateSet alert "sni_all_failed"
-  warn "all candidates failed grace validation; keeping the previous SNI"
+  warn "all candidates failed preflight validation; keeping the previous SNI"
   return 1
+}
+
+sniPickBestNeighbor() {
+  local action="${1:-auto}"
+  local dry_run=0
+  if [[ "${JANUS_SNI_DRY_RUN:-0}" == "1" || "$(stateGet sni_dry_run)" == "true" ]]; then
+    dry_run=1
+  fi
+
+  if [[ "$action" == "build" || ! -s "$SNI_NEIGHBOR_FILE" ]]; then
+    if (( dry_run )); then
+      if sniBuildNeighborList; then
+        cat "$SNI_NEIGHBOR_FILE"
+        log "DRY_RUN: print neighbor list only; do not apply"
+        return 0
+      fi
+      warn "No qualified neighbor SNIs found in same /24 subnet; falling back to global candidate pool"
+      sniPickBestGlobal
+      return $?
+    fi
+    sniBuildNeighborList || true
+    if [[ -s "$SNI_NEIGHBOR_FILE" ]] && __sni_neighbor_apply_first_from_file; then
+      return 0
+    fi
+    warn "No qualified neighbor SNIs found in same /24 subnet; falling back to global candidate pool"
+    sniPickBestGlobal
+    return $?
+  fi
+
+  if (( dry_run )); then
+    cat "$SNI_NEIGHBOR_FILE"
+    log "DRY_RUN: print cached neighbor list only; do not apply"
+    return 0
+  fi
+
+  local seq_fails current self_ip prefix applied=0
+  seq_fails=$(__sni_neighbor_seq_fails_get)
+  current=$(stateGet reality_sni)
+  self_ip=$(__sni_neighbor_ipv4 || true)
+  prefix="${self_ip%.*}"
+
+  if (( seq_fails < 3 )); then
+    local cand score ip rtt html_len cert_days ip_sites ip_dirty
+    while IFS=$'\t' read -r cand score ip rtt html_len cert_days ip_sites ip_dirty || [[ -n "${cand:-}" ]]; do
+      cand=${cand//$'\r'/}
+      [[ -z "$cand" || "$cand" == \#* ]] && continue
+      cand=${cand,,}
+      [[ "$cand" == "${current,,}" ]] && continue
+      if sniDenyMatch "$cand"; then
+        continue
+      fi
+      log "Testing cached neighbor SNI candidate: $cand (score=${score:-?})"
+      if __sni_neighbor_live_retest "$cand" "$prefix" "$self_ip" && sniApply "$cand"; then
+        stateSetJson sni_neighbor_seq_fails 0
+        stateSet sni_last_score_summary "score=${score:-0} domain=${cand} mode=neighbor ip=${ip:--} rtt=${rtt:-0}ms html=${html_len:-0}B cert=${cert_days:-0}d ip_sites=${ip_sites:-0} ip_dirty=${ip_dirty:-0}"
+        stateSetJson alert 'null'
+        ok "Applied neighbor SNI=$cand (score=${score:-0})"
+        applied=1
+        break
+      else
+        warn "Neighbor candidate $cand failed live re-test; appending to denylist"
+        sniDenyAppend "$cand"
+        sniHistoryUpdate "$cand" fail || true
+        seq_fails=$((seq_fails + 1))
+        stateSetJson sni_neighbor_seq_fails "$seq_fails"
+        if (( seq_fails >= 3 )); then
+          warn "Neighbor sequential failover reached ${seq_fails} consecutive failures; triggering full rebuild"
+          break
+        fi
+      fi
+    done < "$SNI_NEIGHBOR_FILE"
+  fi
+
+  if (( applied == 1 )); then
+    return 0
+  fi
+
+  log "Rebuilding same-subnet neighbor SNI candidate list..."
+  stateSetJson sni_neighbor_seq_fails 0
+  sniBuildNeighborList || true
+  if [[ -s "$SNI_NEIGHBOR_FILE" ]] && __sni_neighbor_apply_first_from_file; then
+    return 0
+  fi
+  warn "Neighbor SNI rebuild produced no qualified candidates; falling back to global candidate pool"
+  sniPickBestGlobal
+  return $?
+}
+
+sniPickBest() {
+  local action="${1:-auto}"
+  banner "Reality SNI candidate probing"
+  loadState
+
+  # override priority 1: environment variables
+  if [[ -n "${JANUS_SNI_OVERRIDE:-}" ]]; then
+    log "Using environment variable JANUS_SNI_OVERRIDE=${JANUS_SNI_OVERRIDE}"
+    if sniDenyMatch "$JANUS_SNI_OVERRIDE"; then
+      die "JANUS_SNI_OVERRIDE=${JANUS_SNI_OVERRIDE} is in denylist"
+    fi
+    if [[ "${JANUS_SNI_DRY_RUN:-0}" == "1" ]]; then
+      log "DRY_RUN: skip grace validation"
+      return 0
+    fi
+    sniApply "$JANUS_SNI_OVERRIDE" || die "JANUS_SNI_OVERRIDE preflight validation failed"
+    return 0
+  fi
+
+  # override priority 2: state.sni_override
+  local ov; ov=$(stateGet sni_override)
+  if [[ -n "$ov" && "$ov" != "null" ]]; then
+    log "Using state.sni_override=${ov}"
+    if sniDenyMatch "$ov"; then
+      die "state.sni_override=${ov} is in denylist"
+    fi
+    if [[ "${JANUS_SNI_DRY_RUN:-0}" == "1" || "$(stateGet sni_dry_run)" == "true" ]]; then
+      log "DRY_RUN: skip grace validation"
+      return 0
+    fi
+    sniApply "$ov" || die "sni_override preflight validation failed"
+    return 0
+  fi
+
+  if [[ "$(sniModeGet)" == "neighbor" ]]; then
+    sniPickBestNeighbor "$action"
+  else
+    sniPickBestGlobal
+  fi
+}
+
+__sni_check_active_sni() {
+  local current=$1
+  if [[ "$(sniModeGet)" == "neighbor" && "${JANUS_MOCK_PREFLIGHT:-0}" != "1" && -s "$SNI_NEIGHBOR_FILE" ]] \
+    && awk -F'\t' -v cur="${current,,}" '!/^#/ && NF>=1 && tolower($1)==cur {found=1; exit} END{exit !found}' "$SNI_NEIGHBOR_FILE"; then
+    local self_ip prefix
+    self_ip=$(__sni_neighbor_ipv4 || true)
+    [[ -n "$self_ip" ]] || return 1
+    prefix="${self_ip%.*}"
+    __sni_neighbor_check_same_subnet_dns "$current" "$prefix" "$self_ip" || return 1
+    local http_out first_status
+    http_out=$(curl -I -sS -v --max-time 5 --tlsv1.3 --http2 -A "$SNI_NEIGHBOR_UA" "https://${current}" 2>&1 | tr -d '\r\000' || true)
+    first_status=$(grep -E '^(< )?HTTP/' <<<"$http_out" | head -n 1 || true)
+    [[ "$first_status" =~ ^(\<\ )?HTTP/2\ 200([[:space:]]|$) ]] || return 1
+  fi
+  sniPreflightDomain "$current"
 }
 
 sniCheckNow() {
   loadState
-  local auto; auto=$(stateGet sni_auto_rotate)
-  if [[ "$auto" == "true" ]]; then
-    sniPickBest && sniApplyTriggerRestart || true
+  local current; current=$(stateGet reality_sni)
+  if [[ -z "$current" || "$current" == "null" ]]; then
+    warn "reality_sni is not set; running candidate selection"
+    if sniPickBest; then
+      sniApplyTriggerRestart
+    fi
+    return 0
+  fi
+
+  log "Running Reality SNI auto test for active SNI: $current"
+  if __sni_check_active_sni "$current"; then
+    ok "Active SNI $current passed auto test"
+    return 0
+  fi
+
+  warn "Active SNI $current failed first check; starting confirmation retries..."
+  local wait1="${JANUS_SNI_TEST_RETRY_DELAY_1:-60}"
+  local wait2="${JANUS_SNI_TEST_RETRY_DELAY_2:-300}"
+
+  if (( wait1 > 0 )); then
+    log "Waiting ${wait1}s before confirmation check 2/3..."
+    sleep "$wait1"
+  fi
+  if __sni_check_active_sni "$current"; then
+    ok "Active SNI $current recovered on check 2/3; auto test passed"
+    return 0
+  fi
+  warn "Active SNI $current failed check 2/3"
+
+  if (( wait2 > 0 )); then
+    log "Waiting ${wait2}s before confirmation check 3/3..."
+    sleep "$wait2"
+  fi
+  if __sni_check_active_sni "$current"; then
+    ok "Active SNI $current recovered on check 3/3; auto test passed"
+    return 0
+  fi
+
+  err "Active SNI $current failed all 3 confirmation checks; marking as dead"
+  sniDenyAppend "$current"
+  sniHistoryUpdate "$current" fail || true
+
+  log "Selecting replacement Reality SNI..."
+  if sniPickBest; then
+    sniApplyTriggerRestart
+    ok "Successfully replaced dead SNI $current with $(stateGet reality_sni)"
+    return 0
   else
-    log "auto_rotate=false: check and warn only"
-    JANUS_SNI_DRY_RUN=1 sniPickBest || true
+    err "Failed to find a viable replacement SNI; alert recorded"
+    return 1
   fi
 }
 
@@ -1792,19 +2941,109 @@ sniRotateNow() {
 sniStatus() {
   banner "Reality SNI status"
   loadState
+  local n_total=0 n_avail=0 dom
+  if [[ -s "$SNI_NEIGHBOR_FILE" ]]; then
+    while IFS=$'\t' read -r dom _ || [[ -n "${dom:-}" ]]; do
+      dom=${dom//$'\r'/}
+      [[ -z "$dom" || "$dom" == \#* ]] && continue
+      n_total=$((n_total + 1))
+      if ! sniDenyMatch "$dom"; then
+        n_avail=$((n_avail + 1))
+      fi
+    done < "$SNI_NEIGHBOR_FILE"
+  fi
+  local alert_val; alert_val=$(stateGet alert)
   printf 'Current SNI       : %s\n' "$(stateGet reality_sni)"
-  printf 'last_known_good: %s\n' "$(stateGet last_known_good_sni)"
-  printf 'override       : %s\n' "$(stateGet sni_override)"
-  printf 'auto_rotate    : %s\n' "$(stateGet sni_auto_rotate)"
-  printf 'dry_run        : %s\n' "$(stateGet sni_dry_run)"
-  printf 'mldsa65_enabled: %s\n' "$(stateGet reality_mldsa65_enabled)"
-  printf 'score_summary  : %s\n' "$(stateGet sni_last_score_summary)"
-  printf 'alert          : %s\n' "$(stateGet alert)"
+  printf 'sni_mode          : %s\n' "$(sniModeGet)"
+  printf 'neighbor_cache    : %s total (%s available)\n' "$n_total" "$n_avail"
+  printf 'neighbor_seq_fails: %s\n' "$(__sni_neighbor_seq_fails_get)"
+  printf 'last_known_good   : %s\n' "$(stateGet last_known_good_sni)"
+  printf 'override          : %s\n' "$(stateGet sni_override)"
+  printf 'dry_run           : %s\n' "$(stateGet sni_dry_run)"
+  printf 'mldsa65_enabled   : %s\n' "$(stateGet reality_mldsa65_enabled)"
+  printf 'score_summary     : %s\n' "$(stateGet sni_last_score_summary)"
+  printf 'updated_at        : %s\n' "$(stateGet updated_at)"
+  if [[ -n "$alert_val" && "$alert_val" != "null" ]]; then
+    printf 'alert             : %s\n' "$(__c "$CLR_ERR" "$alert_val")"
+    warn "Reality SNI alert active: $alert_val"
+  else
+    printf 'alert             : %s\n' "${alert_val:-}"
+  fi
+}
+
+sniModeSet() {
+  local mode="${1:-}"
+  if [[ -z "$mode" ]]; then
+    if [[ ! -t 0 ]]; then
+      warn "Missing SNI mode"
+      echo "Usage: janus sni mode <neighbor|global>"
+      return 1
+    fi
+    local cur; cur=$(sniModeGet)
+    echo "Current Reality SNI mode: $cur"
+    echo "  1) neighbor (same-/24 subnet passive discovery + deterministic scoring)"
+    echo "  2) global (curated dictionary + Radar/Tranco + RealiTLScanner -in)"
+    local choice
+    read -r -p "Select SNI mode [1-2]: " choice || true
+    case "$choice" in
+      1) mode="neighbor" ;;
+      2) mode="global" ;;
+      *) warn "Invalid choice"; return 1 ;;
+    esac
+  fi
+
+  case "$mode" in
+    neighbor|global)
+      loadState
+      stateSet sni_mode "$mode"
+      stateSetJson sni_neighbor_seq_fails 0
+      ok "Reality SNI mode set to: $mode"
+      local ov; ov=$(stateGet sni_override)
+      if [[ -z "$ov" || "$ov" == "null" ]]; then
+        if [[ "$mode" == "neighbor" ]]; then
+          if sniPickBest build; then
+            sniApplyTriggerRestart
+          else
+            warn "SNI selection did not complete for mode: $mode"
+            return 1
+          fi
+        else
+          if sniPickBest; then
+            sniApplyTriggerRestart
+          else
+            warn "SNI selection did not complete for mode: $mode"
+            return 1
+          fi
+        fi
+      else
+        warn "sni_override=${ov} is currently active; run 'janus sni clear' to apply mode selection"
+      fi
+      ;;
+    *)
+      warn "Invalid SNI mode: '$mode'. Valid modes are: neighbor, global"
+      return 1
+      ;;
+  esac
 }
 
 sniSetOverride() {
-  local v; prompt v "Enter the SNI domain to lock"
-  [[ -n "$v" ]] || { warn "No SNI entered; canceled"; return 0; }
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    if [[ ! -t 0 ]]; then
+      die "Missing domain parameter for 'janus sni set'"
+    fi
+    prompt v "Enter the SNI domain to lock"
+    [[ -n "$v" ]] || { warn "No SNI entered; canceled"; return 0; }
+  fi
+  v=$(tr '[:upper:]' '[:lower:]' <<<"$v" | tr -d '[:space:]')
+  if sniDenyMatch "$v"; then
+    err "$v is in denylist ($SNI_DENY_FILE); refusing to set"
+    return 1
+  fi
+  if ! sniPreflightDomain "$v"; then
+    err "$v preflight check failed; override was not applied"
+    return 1
+  fi
   local old_ov; old_ov=$(stateGet sni_override)
   stateSet sni_override "$v"
   if ! sniApply "$v"; then
@@ -1814,7 +3053,7 @@ sniSetOverride() {
     else
       stateSetJson sni_override 'null'
     fi
-    err "$v grace check failed; override was not applied"
+    err "$v apply failed"
     return 1
   fi
   sniApplyTriggerRestart
@@ -1832,12 +3071,12 @@ sniClearOverride() {
   current=$(stateGet reality_sni)
   fallback=$(stateGet last_known_good_sni)
   if [[ -n "$fallback" && "$fallback" != "null" && "$fallback" != "$old_ov" ]]; then
-    if sniApply "$fallback"; then
+    if ! sniDenyMatch "$fallback" && sniApply "$fallback"; then
       sniApplyTriggerRestart
       ok "Cleared sni_override and restored last_known_good_sni=$fallback"
       return 0
     fi
-    warn "Cleared sni_override, but last_known_good_sni=$fallback grace check failed; current reality_sni remains ${current:-unknown}"
+    warn "Cleared sni_override, but last_known_good_sni=$fallback preflight check failed; current reality_sni remains ${current:-unknown}"
     warn "to reselect immediately, use menu 4.1 to rotate SNI now"
     return 1
   fi
@@ -2146,6 +3385,10 @@ __reality_stream() {
   if [[ "$server_names" == "[]" || -z "$server_names" ]]; then
     server_names=$(jq -n --arg a "$sni" '[$a]')
   fi
+  # Note on realitySettings:
+  # Upstream commit af7eb68 (v26.7.11+) checks client version in SessionId AEAD.
+  # To bypass client version filtering, "minClientVer": "0.0.0" can be set here.
+  # Commit 8cdf7bf9 (v26.9.8+) strictly enforces X25519MLKEM768 KeyShare ordering.
   jq -n --arg net "$network" --arg sni "$sni" --arg priv "$priv" \
         --arg sid "$sid" --arg seed "$seed" \
         --argjson names "$server_names" --argjson mldsa "${mldsa:-false}" \
@@ -2392,7 +3635,7 @@ xrayConfigAssemble() {
   mkdir -p "$XRAY_DIR"
   local tmp; tmp=$(mktemp --suffix=.json)
   xrayConfigBuildFile "$tmp"
-  if ! "$XRAY_BIN" run -test -c "$tmp" >/dev/null 2>&1; then
+  if [[ -x "$XRAY_BIN" ]] && ! "$XRAY_BIN" run -test -c "$tmp" >/dev/null 2>&1; then
     "$XRAY_BIN" run -test -c "$tmp" 2>&1 | head -n 30 >&2
     rm -f "$tmp"
     die "Xray config validation failed"
@@ -2444,7 +3687,7 @@ sboxConfigAssemble() {
   mkdir -p "$SBOX_DIR"
   local tmp; tmp=$(mktemp --suffix=.json)
   sboxConfigBuildFile "$tmp"
-  if ! "$SBOX_BIN" check -c "$tmp" >/dev/null 2>&1; then
+  if [[ -x "$SBOX_BIN" ]] && ! "$SBOX_BIN" check -c "$tmp" >/dev/null 2>&1; then
     "$SBOX_BIN" check -c "$tmp" 2>&1 | head -n 30 >&2
     rm -f "$tmp"
     die "sing-box config validation failed"
@@ -2588,7 +3831,7 @@ EOF
 unitSniRotate() {
   cat > "/etc/systemd/system/${UNIT_SNI_S}" <<EOF
 [Unit]
-Description=janus SNI rotate (oneshot)
+Description=janus SNI auto test (oneshot)
 After=network-online.target
 
 [Service]
@@ -2597,11 +3840,11 @@ ExecStart=${CLI_PATH} sni check
 EOF
   cat > "/etc/systemd/system/${UNIT_SNI_T}" <<EOF
 [Unit]
-Description=janus SNI rotate timer (daily)
+Description=janus SNI auto test timer (6h)
 
 [Timer]
-OnCalendar=*-*-* 04:00:00
-RandomizedDelaySec=2h
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
 Persistent=true
 Unit=${UNIT_SNI_S}
 
@@ -3079,7 +4322,7 @@ link_CVlessXHTTP() {
   local host; host=$(__sub_cdnserver)
   local cdn; cdn=$(__sub_cdnhost)
   local p; p=$(__urlenc "$(cdnPath C-VLESS-XHTTP)")
-  printf 'vless://%s@%s:443?security=tls&sni=%s&type=xhttp&host=%s&path=%s&mode=auto&alpn=h3&encryption=none#%s' \
+  printf 'vless://%s@%s:443?security=tls&sni=%s&type=xhttp&host=%s&path=%s&mode=auto&alpn=h3,h2&encryption=none#%s' \
     "$uuid" "$host" "$cdn" "$cdn" "$p" "$(__urlenc "C-VLESS-XHTTP")"
 }
 
@@ -3269,6 +4512,7 @@ mihomo_RVlessVision() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      support-x25519mlkem768: true
 $(mihomoRealityVerifyBlock "      ")
     client-fingerprint: chrome
 EOF
@@ -3299,6 +4543,7 @@ mihomo_RVlessXHTTP() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      support-x25519mlkem768: true
 $(mihomoRealityVerifyBlock "      ")
     client-fingerprint: chrome
 EOF
@@ -3328,6 +4573,7 @@ mihomo_RVlessGRPC() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      support-x25519mlkem768: true
 $(mihomoRealityVerifyBlock "      ")
     client-fingerprint: chrome
 EOF
@@ -3350,6 +4596,7 @@ mihomo_CVlessXHTTP() {
     servername: ${cdn}
     alpn:
       - h3
+      - h2
     xhttp-opts:
       path: "${path}"
       mode: auto
@@ -3600,6 +4847,25 @@ mihomoPrintProxyList() {
   done
 }
 
+subRuleModeGet() {
+  local m; m=$(stateGet sub_rule_mode)
+  case "$m" in
+    online-whitelist|online-blacklist) printf '%s' "$m" ;;
+    *) printf 'geosite' ;;
+  esac
+}
+
+# generateMihomoFullSub: output self-contained full Mihomo (Clash.Meta) YAML
+# Design and responsibility boundary:
+# 1. Server-generated subscription goal: ensure any compatible client imported bare
+#    (without external override scripts) can resolve proxy hostnames (r.<root>, cdn.<root>)
+#    over domestic direct DNS and establish the initial proxy connection.
+# 2. Client global script goal: once connectivity is established, apply user-specific
+#    DNS leak prevention and custom routing rules locally.
+# 3. Omitting reachable domestic direct DNS or depending on remote DNS rule sets causes
+#    a cold-start deadlock (proxy domains fail to resolve before a tunnel exists). Therefore
+#    the server DNS block stays self-contained with domestic direct DNS, explicit
+#    proxy-server-nameserver and default-nameserver, and built-in geosite:private,cn rules.
 generateMihomoFullSub() {
   loadState; stateEnsureProtocolSecrets; protoApplyOverride
   local tag enabled_count=0
@@ -3609,9 +4875,10 @@ generateMihomoFullSub() {
     fi
   done
   if (( enabled_count == 0 )); then
-    warn "mihomo-full needs at least one enabled Mihomo proxy"
+    warn "mihomo needs at least one enabled Mihomo proxy"
     return 1
   fi
+  local rule_mode; rule_mode=$(subRuleModeGet)
   cat <<EOF
 # janus mihomo full config (inline)
 mixed-port: 7890
@@ -3627,12 +4894,39 @@ dns:
   enable: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  respect-rules: true
+  use-system-hosts: false
+  cache-algorithm: arc
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "+.time.apple.com"
+    - "pool.ntp.org"
+    - "time.*.com"
+    - "time.*.gov"
+    - "time.*.edu.cn"
+    - "+.music.163.com"
+    - "+.126.net"
   default-nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  direct-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
+    - 223.5.5.5
+    - 119.29.29.29
+    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "geosite:private,cn":
+      - https://223.5.5.5/dns-query
+      - https://doh.pub/dns-query
 proxies:
 EOF
   for tag in "${PROTO_TAGS[@]}"; do
@@ -3655,15 +4949,129 @@ EOF
       - AUTO
 EOF
   mihomoPrintProxyList
-  cat <<EOF
-rule-providers: {}
+
+  case "$rule_mode" in
+    online-whitelist)
+      cat <<EOF
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
+    path: "./ruleset/loyalsoldier/reject.yaml"
+    interval: 86400
+  direct:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt"
+    path: "./ruleset/loyalsoldier/direct.yaml"
+    interval: 86400
+  proxy:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt"
+    path: "./ruleset/loyalsoldier/proxy.yaml"
+    interval: 86400
+  private:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
+    path: "./ruleset/loyalsoldier/private.yaml"
+    interval: 86400
+  applications:
+    type: http
+    behavior: classical
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+    path: "./ruleset/loyalsoldier/applications.yaml"
+    interval: 86400
+  cncidr:
+    type: http
+    behavior: ipcidr
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
+    path: "./ruleset/loyalsoldier/cncidr.yaml"
+    interval: 86400
+  lancidr:
+    type: http
+    behavior: ipcidr
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
+    path: "./ruleset/loyalsoldier/lancidr.yaml"
+    interval: 86400
 rules:
-  - GEOIP,CN,DIRECT
+  - RULE-SET,applications,DIRECT
+  - RULE-SET,private,DIRECT
+  - RULE-SET,reject,REJECT
+  - RULE-SET,lancidr,DIRECT,no-resolve
+  - RULE-SET,proxy,PROXY
+  - RULE-SET,direct,DIRECT
+  - RULE-SET,cncidr,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT,no-resolve
   - MATCH,PROXY
 EOF
+      ;;
+    online-blacklist)
+      cat <<EOF
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
+    path: "./ruleset/loyalsoldier/reject.yaml"
+    interval: 86400
+  gfw:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt"
+    path: "./ruleset/loyalsoldier/gfw.yaml"
+    interval: 86400
+  private:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
+    path: "./ruleset/loyalsoldier/private.yaml"
+    interval: 86400
+  applications:
+    type: http
+    behavior: classical
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+    path: "./ruleset/loyalsoldier/applications.yaml"
+    interval: 86400
+  tld-not-cn:
+    type: http
+    behavior: domain
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt"
+    path: "./ruleset/loyalsoldier/tld-not-cn.yaml"
+    interval: 86400
+  lancidr:
+    type: http
+    behavior: ipcidr
+    url: "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
+    path: "./ruleset/loyalsoldier/lancidr.yaml"
+    interval: 86400
+rules:
+  - RULE-SET,applications,DIRECT
+  - RULE-SET,private,DIRECT
+  - RULE-SET,reject,REJECT
+  - RULE-SET,lancidr,DIRECT,no-resolve
+  - RULE-SET,gfw,PROXY
+  - RULE-SET,tld-not-cn,PROXY
+  - MATCH,DIRECT
+EOF
+      ;;
+    geosite|*)
+      cat <<EOF
+rule-providers: {}
+rules:
+  - GEOSITE,category-ads-all,REJECT
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,PROXY
+EOF
+      ;;
+  esac
 }
 
-# generateSboxSub: output sing-box outbound JSON(outbounds array only)
+# generateSboxSub: output self-contained sing-box JSON config
 generateSboxSub() {
   loadState; stateEnsureProtocolSecrets; protoApplyOverride
   local uuid; uuid=$(__sub_uuid)
@@ -3726,7 +5134,7 @@ generateSboxSub() {
                utls:{enabled:true, fingerprint:"chrome"}} },
         { type:"vless", tag:"C-VLESS-XHTTP", server:$cdn_server, server_port:443,
           uuid:$u, transport:{type:"http", path:$c_xhttp},
-          tls:{enabled:true, server_name:$cdn, alpn:["h3"]} },
+          tls:{enabled:true, server_name:$cdn, alpn:["h3","h2"]} },
         { type:"vless", tag:"C-VLESS-WS", server:$cdn_server, server_port:443,
           uuid:$u, transport:{type:"ws", path:$c_vless_ws, headers:{Host:$cdn}},
           tls:{enabled:true, server_name:$cdn} },
@@ -3761,29 +5169,83 @@ generateSboxSub() {
         { type:"block",  tag:"block" }
       ]
     } | .outbounds as $all
-      | .outbounds =
-          ( [ $tags[]
-              | . as $t
-              | select(($enabled | index($t)) != null)
-              | $all[] | select(.tag == $t) ]
-            + ( $all
-                | map(select(.tag == "D-ShadowTLS-SS-shadowtls"))
-                | map(select( ($enabled | index("D-ShadowTLS-SS")) != null )) )
-            + [ $all[] | select(.tag == "direct" or .tag == "block") ] )'
+      | ( [ $tags[]
+            | . as $t
+            | select(($enabled | index($t)) != null)
+            | $all[] | select(.tag == $t) ]
+          + ( $all
+              | map(select(.tag == "D-ShadowTLS-SS-shadowtls"))
+              | map(select( ($enabled | index("D-ShadowTLS-SS")) != null )) )
+          + [ $all[] | select(.tag == "direct" or .tag == "block") ] ) as $filtered_outbounds
+      | ( $filtered_outbounds | map(select(.type != "direct" and .type != "block" and .type != "shadowtls")) | map(.tag) ) as $proxy_tags
+      | ( [
+            {
+              type: "selector",
+              tag: "PROXY",
+              outbounds: (["AUTO"] + $proxy_tags),
+              default: "AUTO",
+              interrupt_exist_connections: true
+            },
+            {
+              type: "urltest",
+              tag: "AUTO",
+              outbounds: $proxy_tags,
+              url: "https://www.gstatic.com/generate_204",
+              interval: "3m",
+              tolerance: 50,
+              interrupt_exist_connections: true
+            }
+          ] + $filtered_outbounds ) as $final_outbounds
+      | {
+          dns: {
+            servers: [
+              { tag: "dns-remote", type: "https", server: "1.1.1.1", path: "/dns-query", detour: "PROXY" },
+              { tag: "dns-direct", type: "udp", server: "223.5.5.5", server_port: 53 }
+            ],
+            rules: [
+              { rule_set: "geosite-cn", server: "dns-direct" }
+            ],
+            final: "dns-remote",
+            strategy: "ipv4_only"
+          },
+          inbounds: [
+            { type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 2080 }
+          ],
+          outbounds: $final_outbounds,
+          route: {
+            rules: [
+              { action: "hijack-dns" },
+              { ip_is_private: true, outbound: "direct" },
+              { rule_set: "geosite-cn", outbound: "direct" },
+              { rule_set: "geoip-cn", outbound: "direct" }
+            ],
+            rule_set: [
+              { tag: "geosite-cn", type: "remote", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", download_detour: "PROXY" },
+              { tag: "geoip-cn",   type: "remote", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",   download_detour: "PROXY" }
+            ],
+            default_domain_resolver: "dns-direct",
+            final: "PROXY",
+            auto_detect_interface: true
+          },
+          experimental: {
+            cache_file: {
+              enabled: true
+            }
+          }
+        }'
 }
 
-# subPublish: write <token>/v<ts>/{default,mihomo,sbox,mihomo-full} plus the latest symlink
+# subPublish: write <token>/v<ts>/{x-ray,mihomo,sing-box} plus the latest symlink
 subPublish() {
   local token=$1
-  local default=$2 mihomo=$3 sbox=$4 mihomo_full=$5
+  local xray=$2 mihomo=$3 sbox=$4
   mkdir -p "${WEBROOT}/${token}"
   local ts; ts=$(date +%Y%m%d%H%M%S)
   local d="${WEBROOT}/${token}/v${ts}"
   mkdir -p "$d"
-  printf '%s' "$default"     > "${d}/default"
-  printf '%s' "$mihomo"      > "${d}/mihomo"
-  printf '%s' "$sbox"        > "${d}/sbox"
-  printf '%s' "$mihomo_full" > "${d}/mihomo-full"
+  printf '%s' "$xray"   > "${d}/x-ray"
+  printf '%s' "$mihomo"  > "${d}/mihomo"
+  printf '%s' "$sbox"    > "${d}/sing-box"
   chmod 644 "${d}"/*
   ln -sfn "v${ts}" "${WEBROOT}/${token}/latest"
   # Keep the latest five versions
@@ -3798,21 +5260,18 @@ subPublish() {
 subRegenAllCore() {
   loadState
   local token; token=$(subToken)
-  local d m s mf failed=0
-  if ! d=$(generateDefaultSub); then
-    warn "default subscription generation failed"
+  local xray mihomo sbox failed=0
+  if ! xray=$(generateDefaultSub); then
+    warn "x-ray subscription generation failed"
     failed=1
   fi
-  if ! m=$(generateClashMetaSub); then
+  # generateClashMetaSub (mihomo-bare proxies-only) — soft-deleted from publish pipeline
+  if ! mihomo=$(generateMihomoFullSub); then
     warn "mihomo subscription generation failed"
     failed=1
   fi
-  if ! s=$(generateSboxSub); then
+  if ! sbox=$(generateSboxSub); then
     warn "sing-box subscription generation failed"
-    failed=1
-  fi
-  if ! mf=$(generateMihomoFullSub); then
-    warn "mihomo-full subscription generation failed"
     failed=1
   fi
   if (( failed )); then
@@ -3821,7 +5280,7 @@ subRegenAllCore() {
     return 1
   fi
   stateSetJson alert 'null'
-  subPublish "$token" "$d" "$m" "$s" "$mf"
+  subPublish "$token" "$xray" "$mihomo" "$sbox"
 }
 
 subRegenAll() {
@@ -3852,8 +5311,8 @@ subShow() {
   local tok; tok=$(stateGet sub_token)
   [[ -n "$tok" ]] || die "state.sub_token is missing; regenerate subscriptions first"
   local base="https://${sub_host}/${tok}/latest"
-  local names=(default mihomo mihomo-full sbox)
-  local labels=("default subscription" "mihomo provider" "mihomo full config" "sing-box JSON")
+  local names=(x-ray mihomo sing-box)
+  local labels=("x-ray subscription" "mihomo config" "sing-box config")
   local i url
   for i in "${!names[@]}"; do
     url="${base}/${names[$i]}"
@@ -3872,7 +5331,46 @@ subShow() {
   fi
 }
 
-subDumpMihomo()     { generateClashMetaSub; }
+subRuleModeSet() {
+  local mode="${1:-}"
+  if [[ -z "$mode" ]]; then
+    if [[ ! -t 0 ]]; then
+      warn "Missing rule mode"
+      echo "Usage: janus sub rule <geosite|online-whitelist|online-blacklist>"
+      return 1
+    fi
+    local cur; cur=$(subRuleModeGet)
+    echo "Current Mihomo rule mode: $cur"
+    echo "  1) geosite (built-in GeoSite/GeoIP rules, offline/fast)"
+    echo "  2) online-whitelist (Loyalsoldier remote rules, whitelist CN direct)"
+    echo "  3) online-blacklist (Loyalsoldier remote rules, blacklist GFW proxy)"
+    local choice
+    read -r -p "Select rule mode [1-3]: " choice || true
+    case "$choice" in
+      1) mode="geosite" ;;
+      2) mode="online-whitelist" ;;
+      3) mode="online-blacklist" ;;
+      *) warn "Invalid choice"; return 1 ;;
+    esac
+  fi
+
+  case "$mode" in
+    geosite|online-whitelist|online-blacklist)
+      loadState
+      stateSet sub_rule_mode "$mode"
+      ok "Mihomo rule mode set to: $mode"
+      subRegenAllCore || { warn "Subscription regeneration failed"; return 1; }
+      ok "Subscriptions regenerated with rule mode: $mode"
+      ;;
+    *)
+      warn "Invalid rule mode: '$mode'. Valid modes are: geosite, online-whitelist, online-blacklist"
+      return 1
+      ;;
+  esac
+}
+
+# subDumpMihomo — soft-deleted (mihomo-bare proxies-only no longer published)
+# subDumpMihomo()     { generateClashMetaSub; }
 subDumpSbox()       { generateSboxSub; }
 subDumpDefault()    {
   local raw; raw=$(generateDefaultSub) || return $?
@@ -3897,7 +5395,7 @@ subExportCurrent() {
 janus current configuration export
 domain=${ROOT_DOMAIN}
 generated_at=$(date -Is)
-formats=default,mihomo,mihomo-full,sbox
+formats=x-ray,mihomo,sing-box
 EOF
   tar -czf "${out}.tar.gz" -C "$out" .
   rm -rf "$out"
@@ -3926,14 +5424,12 @@ subServeOne() {
   fi
 
   case "$fmt" in
-    default)
-      file="${WEBROOT}/${token}/latest/default"; ctype="text/plain; charset=utf-8"; filename="janus-default.txt" ;;
+    x-ray)
+      file="${WEBROOT}/${token}/latest/x-ray"; ctype="text/plain; charset=utf-8"; filename="janus-x-ray.txt" ;;
     mihomo)
       file="${WEBROOT}/${token}/latest/mihomo"; ctype="text/yaml; charset=utf-8"; filename="janus-mihomo.yaml"; add_update_header=1 ;;
-    sbox)
-      file="${WEBROOT}/${token}/latest/sbox"; ctype="application/json; charset=utf-8"; filename="janus-sing-box.json" ;;
-    mihomo-full)
-      file="${WEBROOT}/${token}/latest/mihomo-full"; ctype="text/yaml; charset=utf-8"; filename="janus-mihomo-full.yaml"; add_update_header=1 ;;
+    sing-box)
+      file="${WEBROOT}/${token}/latest/sing-box"; ctype="application/json; charset=utf-8"; filename="janus-sing-box.json" ;;
     *)
       subServeNotFound; return 0 ;;
   esac
@@ -3950,7 +5446,7 @@ subServeOne() {
   printf 'Cache-Control: no-store\r\n'
   printf 'Content-Disposition: attachment; filename="%s"\r\n' "$filename"
   if (( add_update_header )); then
-    printf 'profile-update-interval: 12\r\n'
+    printf 'profile-update-interval: 24\r\n'
   fi
   printf '\r\n'
   [[ "$method" == "HEAD" ]] || cat "$file"
@@ -4202,6 +5698,7 @@ menuReality() {
   5) RealiTLScanner candidate validation
   6) ML-DSA-65 toggle
   7) Show curated dictionary
+  8) Set SNI mode (neighbor/global)
   0) Back
   Tip: Reality reset Reality keys/short_id from the advanced menu
 X
@@ -4214,6 +5711,7 @@ X
       5) menuInvoke sniScannerExtend; menuPause ;;
       6) menuInvoke realityToggleMldsa; menuPause ;;
       7) menuInvoke sniShowDict; menuPause ;;
+      8) menuInvoke sniModeSet; menuPause ;;
       0) return ;;
       *) warn "Invalid";;
     esac
@@ -4260,6 +5758,7 @@ menuSub() {
   2) Rotate subscription link/main credential
   3) Show subscriptions(with QR codes)
   4) Export current configuration to file
+  5) Set Mihomo rule mode
   0) Back
 X
     local c; read -r -p "Select: " c || true
@@ -4268,6 +5767,7 @@ X
       2) menuInvoke subRotateToken; menuPause ;;
       3) menuInvoke subShow; menuPause ;;
       4) menuInvoke subExportCurrent; menuPause ;;
+      5) menuInvoke subRuleModeSet; menuPause ;;
       0) return ;;
       *) warn "Invalid";;
     esac
@@ -4377,15 +5877,14 @@ menuAdvanced() {
   3) Force-rewrite all units
   4) View state
   5) Edit state
-  6) Toggle SNI auto_rotate
-  7) Reset Reality keys/credentials
-  8) Switch certificate CA
-  9) Restart one service
- 10) Start/stop one service
- 11) Follow service logs
- 12) Export diagnostics bundle
- 13) Delete Tunnel only(danger)
- 14) RealiTLScanner raw scan(danger)
+  6) Reset Reality keys/credentials
+  7) Switch certificate CA
+  8) Restart one service
+  9) Start/stop one service
+ 10) Follow service logs
+ 11) Export diagnostics bundle
+ 12) Delete Tunnel only(danger)
+ 13) RealiTLScanner raw scan(danger)
   0) Back
 X
     local c; read -r -p "Select: " c || true
@@ -4395,15 +5894,14 @@ X
       3) menuInvoke advRewriteUnits; menuPause ;;
       4) menuInvoke advDumpState; menuPause ;;
       5) menuInvoke advEditState; menuPause ;;
-      6) menuInvoke advToggleSniAutoRotate; menuPause ;;
-      7) menuInvoke realityResetCredentials; menuPause ;;
-      8) menuInvoke certSwitchCA; menuPause ;;
-      9) menuInvoke svcRestartOne; menuPause ;;
-      10) menuInvoke svcToggleOne; menuPause ;;
-      11) menuInvoke svcLogFollow; menuPause ;;
-      12) menuInvoke diagExport; menuPause ;;
-      13) menuInvoke cfTunnelDeleteMenu; menuPause ;;
-      14) menuInvoke advRealiTLScannerAddr; menuPause ;;
+      6) menuInvoke realityResetCredentials; menuPause ;;
+      7) menuInvoke certSwitchCA; menuPause ;;
+      8) menuInvoke svcRestartOne; menuPause ;;
+      9) menuInvoke svcToggleOne; menuPause ;;
+      10) menuInvoke svcLogFollow; menuPause ;;
+      11) menuInvoke diagExport; menuPause ;;
+      12) menuInvoke cfTunnelDeleteMenu; menuPause ;;
+      13) menuInvoke advRealiTLScannerAddr; menuPause ;;
       0) return ;;
       *) warn "Invalid";;
     esac
@@ -4959,7 +6457,7 @@ diagExport() {
   local dir; dir=$(mktemp -d)
   jq '{
         schema_version, ns, install_step, domain, acme_email, ipv4, ipv6,
-        reality_sni, last_known_good_sni, sni_override, sni_auto_rotate, sni_dry_run,
+        reality_sni, last_known_good_sni, sni_override, sni_dry_run,
         sni_grace_server_names, sni_history, reality_mldsa65_enabled,
         xhttp_path, grpc_service_name, cf_account_id, cf_zone_id, cf_tunnel_id,
         cf_tunnel_name, acme_ca, proto_enabled, proto_port_override,
@@ -5194,35 +6692,6 @@ advEditState() {
   ok "state.json validation passed"
 }
 
-sniSetAutoRotate() {
-  local nv=$1 cur
-  case "$nv" in
-    true|false) ;;
-    on) nv=true ;;
-    off) nv=false ;;
-    *) die "Usage: janus sni auto <on|off>";;
-  esac
-  cur=$(stateGet sni_auto_rotate)
-  if [[ "$cur" == "$nv" ]]; then
-    ok "sni_auto_rotate=$nv(no change needed)"
-    return 0
-  fi
-  if [[ "$nv" == "true" ]]; then
-    warn "after auto_rotate is enabled, the daily timer fires, and automatically applies the highest-scoring SNI"
-    warn "serverNames keep old/new values for 24-72h during switching, client subscriptions must be refreshed to apply the new serverName"
-    confirm "Confirm enabling?" || return 0
-  fi
-  stateSetJson sni_auto_rotate "$nv"
-  ok "sni_auto_rotate=$nv"
-}
-
-advToggleSniAutoRotate() {
-  local cur nv
-  cur=$(stateGet sni_auto_rotate)
-  [[ "$cur" == "true" ]] && nv=false || nv=true
-  sniSetAutoRotate "$nv"
-}
-
 # ----- modular installation -----
 moduleSysDeps() {
   banner "System dependencies and kernel tuning"
@@ -5454,9 +6923,9 @@ Usage:
   janus quick                 run quick install
   janus status                diagnostics overview
   janus log <unit>            journalctl -fu <unit>
-  janus sni    <check|rotate|show|set|clear|auto on|auto off>
+  janus sni    <check|rotate|show|set|clear|mode>
   janus proto  <list|enable <tag>|disable <tag>|port <tag> <port>|reset>
-  janus sub    <regen|rotate|show|export>
+  janus sub    <regen|rotate|show|export|rule <mode>>
   janus cfst   <status|refresh|on|off|clear>
   janus cf     <migrate <new-root>|dns|tunnel>
   janus cert   <show|ca <name>>
@@ -5475,12 +6944,12 @@ __help_sub() {
     sni)
       cat <<'EOF'
 janus sni <subcmd>
-  check                       probe and warn only(no rotation)
+  check                       auto test current SNI (6h timer)
   rotate                      rotate immediately(with grace validation)
   show                        current status
-  set                         Set override
+  set <domain>                set override (prompts if no domain)
   clear                       Clear override
-  auto <on|off>               Toggle auto_rotate
+  mode <neighbor|global>      set SNI selection mode
 EOF
       ;;
     proto)
@@ -5496,7 +6965,7 @@ EOF
     sub)
       cat <<'EOF'
 janus sub <subcmd>
-  regen | rotate | show | export
+  regen | rotate | show | export | rule <geosite|online-whitelist|online-blacklist>
 EOF
       ;;
     cfst)
@@ -5620,17 +7089,9 @@ main() {
         check) shift 2>/dev/null || true; sniCheckNow ;;
         rotate) shift 2>/dev/null || true; sniRotateNow ;;
         show) shift 2>/dev/null || true; sniStatus ;;
-        set) shift 2>/dev/null || true; sniSetOverride ;;
+        set) shift 2>/dev/null || true; sniSetOverride "$@" ;;
         clear) shift 2>/dev/null || true; sniClearOverride ;;
-        auto)
-          shift 2>/dev/null || true
-          case "${1:-}" in
-            on)  sniSetAutoRotate true ;;
-            off) sniSetAutoRotate false ;;
-            --help|-h) __help_sub sni ;;
-            *) __help_fail sni ;;
-          esac
-          ;;
+        mode) shift 2>/dev/null || true; sniModeSet "$@" ;;
         --help|-h) __help_sub sni ;;
         *) __help_fail sni ;;
       esac
@@ -5666,6 +7127,10 @@ main() {
         rotate) shift 2>/dev/null || true; subRotateToken ;;
         show) shift 2>/dev/null || true; subShow ;;
         export) shift 2>/dev/null || true; subExportCurrent ;;
+        rule)
+          shift 2>/dev/null || true
+          subRuleModeSet "$@"
+          ;;
         --help|-h) __help_sub sub ;;
         *) __help_fail sub ;;
       esac
