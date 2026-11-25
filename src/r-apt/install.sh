@@ -36,6 +36,7 @@ readonly VERSION="1.0"
 readonly WORKDIR="${JANUS_WORKDIR:-/etc/janus}"
 readonly WEBROOT="${JANUS_WEBROOT:-/var/lib/janus/web}"
 readonly BACKUP_DIR="/var/lib/janus/backups"
+readonly EXPORT_DIR="${JANUS_EXPORT_DIR:-/var/lib/janus/exports}"
 readonly TOOLS_DIR="${WORKDIR}/tools"
 readonly STATE_FILE="${JANUS_STATE_FILE:-${WORKDIR}/state.json}"
 readonly STATE_LOCK="${JANUS_STATE_LOCK:-/var/run/janus-state.lock}"
@@ -303,6 +304,7 @@ __state_defaults() {
   "acme_ca": "letsencrypt",
   "proto_enabled": ["R-VLESS-Vision"],
   "proto_port_override": {},
+  "sub_rule_mode": "geosite",
   "sub_include_naive_mihomo": false,
   "sub_darkhttpd_port": 18470,
   "cfst_enabled": false,
@@ -2229,32 +2231,8 @@ __sni_neighbor_fetch_rapiddns() {
     ' || true
 }
 
-sniFetchNeighborRaw() {
-  local cidr=$1 self_ip=$2
-  local net_ip="${cidr%/*}"
-  local prefix="${net_ip%.*}"
-  local raw=""
-
-  raw=$(__sni_neighbor_fetch_he_certs "$cidr" "$prefix")
-  if [[ -z "${raw//[[:space:]]/}" ]]; then
-    log "Tier 1 (bgp.he.net certs API) returned empty; falling back to Tier 2 (hackertarget)" >&2
-    raw=$(__sni_neighbor_fetch_hackertarget "$cidr" "$prefix")
-  fi
-  if [[ -z "${raw//[[:space:]]/}" ]]; then
-    log "Tier 2 (hackertarget) returned empty; falling back to Tier 3+4 (bgp.he.net #dns + rapiddns)" >&2
-    local raw3 raw4
-    raw3=$(__sni_neighbor_fetch_he_dns "$cidr" "$prefix")
-    raw4=$(__sni_neighbor_fetch_rapiddns "$cidr" "$prefix")
-    raw=$(printf '%s\n%s\n' "$raw3" "$raw4")
-  fi
-
-  [[ -n "${raw//[[:space:]]/}" ]] || return 0
-
-  local d1 d2 d3
-  d1=$(stateGet domain); d1=${d1,,}; d1=${d1//[$' \t\r\n']/}
-  d2="${ROOT_DOMAIN:-}"; d2=${d2,,}; d2=${d2//[$' \t\r\n']/}
-  d3=$(stateGet cf_domain); d3=${d3,,}; d3=${d3//[$' \t\r\n']/}
-
+__sni_neighbor_filter_raw() {
+  local prefix=$1 self_ip=$2 d1=$3 d2=$4 d3=$5
   awk -v self_ip="$self_ip" -v pfx="${prefix}." \
       -v d1="$d1" -v d2="$d2" -v d3="$d3" '
     function is_own(d,    arr, k, od) {
@@ -2291,11 +2269,47 @@ sniFetchNeighborRaw() {
       if (is_own(dom)) next
       if (dom !~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/) next
       emit_row(ip, dom)
-      if (dom ~ /^[^.]+\.[^.]+$/ && dom !~ /^www\./) {
+      if (dom !~ /^www\./ && (dom ~ /^[^.]+\.[^.]+$/ || dom ~ /^[^.]+\.(co|com|org|net|gov|edu)\.[a-z]{2}$/)) {
         emit_row(ip, "www." dom)
       }
     }
-  ' <<<"$raw"
+  '
+}
+
+sniFetchNeighborRaw() {
+  local cidr=$1 self_ip=$2
+  local net_ip="${cidr%/*}"
+  local prefix="${net_ip%.*}"
+  local d1 d2 d3
+  d1=$(stateGet domain); d1=${d1,,}; d1=${d1//[$' \t\r\n']/}
+  d2="${ROOT_DOMAIN:-}"; d2=${d2,,}; d2=${d2//[$' \t\r\n']/}
+  d3=$(stateGet cf_domain); d3=${d3,,}; d3=${d3//[$' \t\r\n']/}
+
+  local raw="" filtered=""
+  raw=$(__sni_neighbor_fetch_he_certs "$cidr" "$prefix")
+  if [[ -n "${raw//[[:space:]]/}" ]]; then
+    filtered=$(__sni_neighbor_filter_raw "$prefix" "$self_ip" "$d1" "$d2" "$d3" <<<"$raw")
+  fi
+  if [[ -z "${filtered//[[:space:]]/}" ]]; then
+    log "Tier 1 (bgp.he.net certs API) returned empty; falling back to Tier 2 (hackertarget)" >&2
+    raw=$(__sni_neighbor_fetch_hackertarget "$cidr" "$prefix")
+    if [[ -n "${raw//[[:space:]]/}" ]]; then
+      filtered=$(__sni_neighbor_filter_raw "$prefix" "$self_ip" "$d1" "$d2" "$d3" <<<"$raw")
+    fi
+  fi
+  if [[ -z "${filtered//[[:space:]]/}" ]]; then
+    log "Tier 2 (hackertarget) returned empty; falling back to Tier 3+4 (bgp.he.net #dns + rapiddns)" >&2
+    local raw3 raw4
+    raw3=$(__sni_neighbor_fetch_he_dns "$cidr" "$prefix")
+    raw4=$(__sni_neighbor_fetch_rapiddns "$cidr" "$prefix")
+    raw=$(printf '%s\n%s\n' "$raw3" "$raw4")
+    if [[ -n "${raw//[[:space:]]/}" ]]; then
+      filtered=$(__sni_neighbor_filter_raw "$prefix" "$self_ip" "$d1" "$d2" "$d3" <<<"$raw")
+    fi
+  fi
+
+  [[ -n "${filtered//[[:space:]]/}" ]] || return 0
+  printf '%s\n' "$filtered"
 }
 
 __sni_neighbor_domain_ok() {
@@ -2590,16 +2604,18 @@ sniBuildNeighborList() {
     return 1
   fi
 
-  local sorted_top20
-  sorted_top20=$(printf '%s' "$scored_rows" | sort -t$'\t' -k1,1nr -k2,2 | head -n 20)
+  local sorted_rows passed_count=0
+  sorted_rows=$(printf '%s' "$scored_rows" | sort -t$'\t' -k1,1nr -k2,2)
 
   local final_rows=""
   while IFS=$'\t' read -r score dom ip rtt html_len cert_days ip_sites ip_dirty || [[ -n "${score:-}" ]]; do
     [[ -n "$dom" ]] || continue
     if sniPreflightDomain "$dom"; then
       final_rows+="${dom}"$'\t'"${score}"$'\t'"${ip}"$'\t'"${rtt}"$'\t'"${html_len}"$'\t'"${cert_days}"$'\t'"${ip_sites}"$'\t'"${ip_dirty}"$'\n'
+      (( passed_count += 1 ))
+      (( passed_count >= 20 )) && break
     fi
-  done <<<"$sorted_top20"
+  done <<<"$sorted_rows"
 
   if [[ -z "${final_rows//[[:space:]]/}" ]]; then
     warn "No neighbor SNI candidates passed sniPreflightDomain"
@@ -2654,7 +2670,7 @@ __sni_neighbor_apply_first_from_file() {
       ok "Applied neighbor SNI=$dom (score=${score:-0})"
       return 0
     fi
-    return 1
+    warn "Failed to apply neighbor SNI=$dom; trying next candidate"
   done < "$SNI_NEIGHBOR_FILE"
   return 1
 }
@@ -2929,7 +2945,7 @@ sniApplyTriggerRestart() {
 }
 
 sniRotateNow() {
-  banner "rotate immediately Reality SNI(menu 4.1)"
+  banner "Rotate Reality SNI immediately (menu 4.1)"
   if sniPickBest; then
     sniApplyTriggerRestart
   else
@@ -2986,6 +3002,7 @@ sniModeSet() {
     local choice
     read -r -p "Select SNI mode [1-2]: " choice || true
     case "$choice" in
+      "") log "Canceled"; return 0 ;;
       1) mode="neighbor" ;;
       2) mode="global" ;;
       *) warn "Invalid choice"; return 1 ;;
@@ -4499,6 +4516,7 @@ mihomo_RVlessVision() {
   local sni; sni=$(__sub_sni)
   local pbk; pbk=$(__sub_pbk)
   local sid; sid=$(__sub_sid)
+  local pqv_line; pqv_line=$(mihomoRealityVerifyBlock "      ")
   cat <<EOF
   - name: "${tag}"
     type: vless
@@ -4512,10 +4530,11 @@ mihomo_RVlessVision() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      # pre-PQ legacy omitted support-x25519mlkem768
       support-x25519mlkem768: true
-$(mihomoRealityVerifyBlock "      ")
-    client-fingerprint: chrome
 EOF
+  [[ -n "$pqv_line" ]] && printf '%s\n' "$pqv_line"
+  printf '    client-fingerprint: chrome\n'
 }
 
 mihomo_RVlessXHTTP() {
@@ -4528,6 +4547,7 @@ mihomo_RVlessXHTTP() {
   local sid; sid=$(__sub_sid)
   local path; path=$(stateGet xhttp_path)
   [[ -n "$path" ]] || path="/xh"
+  local pqv_line; pqv_line=$(mihomoRealityVerifyBlock "      ")
   cat <<EOF
   - name: "${tag}"
     type: vless
@@ -4543,10 +4563,11 @@ mihomo_RVlessXHTTP() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      # pre-PQ legacy omitted support-x25519mlkem768
       support-x25519mlkem768: true
-$(mihomoRealityVerifyBlock "      ")
-    client-fingerprint: chrome
 EOF
+  [[ -n "$pqv_line" ]] && printf '%s\n' "$pqv_line"
+  printf '    client-fingerprint: chrome\n'
 }
 
 mihomo_RVlessGRPC() {
@@ -4559,6 +4580,7 @@ mihomo_RVlessGRPC() {
   local sid; sid=$(__sub_sid)
   local service; service=$(stateGet grpc_service_name)
   [[ -n "$service" ]] || service="grpc"
+  local pqv_line; pqv_line=$(mihomoRealityVerifyBlock "      ")
   cat <<EOF
   - name: "${tag}"
     type: vless
@@ -4573,10 +4595,11 @@ mihomo_RVlessGRPC() {
     reality-opts:
       public-key: ${pbk}
       short-id: ${sid}
+      # pre-PQ legacy omitted support-x25519mlkem768
       support-x25519mlkem768: true
-$(mihomoRealityVerifyBlock "      ")
-    client-fingerprint: chrome
 EOF
+  [[ -n "$pqv_line" ]] && printf '%s\n' "$pqv_line"
+  printf '    client-fingerprint: chrome\n'
 }
 
 mihomo_CVlessXHTTP() {
@@ -5347,6 +5370,7 @@ subRuleModeSet() {
     local choice
     read -r -p "Select rule mode [1-3]: " choice || true
     case "$choice" in
+      "") log "Canceled"; return 0 ;;
       1) mode="geosite" ;;
       2) mode="online-whitelist" ;;
       3) mode="online-blacklist" ;;
@@ -5369,17 +5393,17 @@ subRuleModeSet() {
   esac
 }
 
-# subDumpMihomo — soft-deleted (mihomo-bare proxies-only no longer published)
+# subDump* helpers — soft-deleted (individual dump entry points retired in favor of subExportCurrent)
 # subDumpMihomo()     { generateClashMetaSub; }
-subDumpSbox()       { generateSboxSub; }
-subDumpDefault()    {
-  local raw; raw=$(generateDefaultSub) || return $?
-  printf '%s\n' "$raw"
-  printf -- '--- base64 decoded ---\n'
-  printf '%s' "$raw" | base64 -d 2>/dev/null || true
-  printf '\n'
-}
-subDumpMihomoFull() { generateMihomoFullSub; }
+# subDumpSbox()       { generateSboxSub; }
+# subDumpDefault()    {
+#   local raw; raw=$(generateDefaultSub) || return $?
+#   printf '%s\n' "$raw"
+#   printf -- '--- base64 decoded ---\n'
+#   printf '%s' "$raw" | base64 -d 2>/dev/null || true
+#   printf '\n'
+# }
+# subDumpMihomoFull() { generateMihomoFullSub; }
 
 subExportCurrent() {
   loadState
@@ -5387,19 +5411,21 @@ subExportCurrent() {
   [[ -n "$tok" ]] || die "sub_token not initialized"
   local src="${WEBROOT}/${tok}/latest"
   [[ -d "$src" ]] || { subRegenAllCore; }
-  local out
-  out="/tmp/janus-current-config-$(date +%Y%m%d%H%M%S)"
-  mkdir -p "$out"
-  cp -a "${WEBROOT}/${tok}/latest/"* "$out"/
-  cat > "${out}/README.txt" <<EOF
+  local ts; ts=$(date +%Y%m%d%H%M%S)
+  local stage; stage=$(mktemp -d)
+  cp -a "${WEBROOT}/${tok}/latest/"* "$stage"/
+  cat > "${stage}/README.txt" <<EOF
 janus current configuration export
 domain=${ROOT_DOMAIN}
 generated_at=$(date -Is)
 formats=x-ray,mihomo,sing-box
 EOF
-  tar -czf "${out}.tar.gz" -C "$out" .
-  rm -rf "$out"
-  ok "exported: ${out}.tar.gz"
+  install -d -m 700 "$EXPORT_DIR"
+  local archive="${EXPORT_DIR}/janus-current-config-${ts}.tar.gz"
+  ( umask 077; tar -czf "$archive" -C "$stage" . )
+  chmod 600 "$archive"
+  rm -rf "$stage"
+  ok "exported: ${archive}"
 }
 
 subServeOne() {
@@ -5691,7 +5717,7 @@ menuReality() {
   while :; do
     cat <<'X'
 [Reality SNI]
-  1) rotate immediately SNI
+  1) Rotate Reality SNI immediately
   2) Show status
   3) Set override
   4) Clear override
@@ -5700,7 +5726,7 @@ menuReality() {
   7) Show curated dictionary
   8) Set SNI mode (neighbor/global)
   0) Back
-  Tip: Reality reset Reality keys/short_id from the advanced menu
+  Tip: reset Reality keys/short_id from the advanced menu
 X
     local c; read -r -p "Select: " c || true
     case "$c" in
@@ -6457,11 +6483,11 @@ diagExport() {
   local dir; dir=$(mktemp -d)
   jq '{
         schema_version, ns, install_step, domain, acme_email, ipv4, ipv6,
-        reality_sni, last_known_good_sni, sni_override, sni_dry_run,
+        reality_sni, last_known_good_sni, sni_override, sni_mode, sni_neighbor_seq_fails, sni_dry_run,
         sni_grace_server_names, sni_history, reality_mldsa65_enabled,
         xhttp_path, grpc_service_name, cf_account_id, cf_zone_id, cf_tunnel_id,
         cf_tunnel_name, acme_ca, proto_enabled, proto_port_override,
-        sub_include_naive_mihomo, sub_darkhttpd_port, cfst_enabled, cfst_best_ip,
+        sub_rule_mode, sub_include_naive_mihomo, sub_darkhttpd_port, cfst_enabled, cfst_best_ip,
         cfst_best_region, cfst_best_speed, cfst_updated_at, alert, ports,
         created_at, updated_at, sni_last_score_summary
       }' "$STATE_FILE" > "${dir}/state.json"
@@ -6732,6 +6758,41 @@ moduleInitState() {
 }
 
 # ============ SECTION 19 quickInstall / uninstall / backup ============
+quickStepHealthy() {
+  local n=$1
+  case "$n" in
+    1) depsAllInstalled ;;
+    2) [[ -n "$(stateGet domain)" && -n "$(stateGet acme_email)" && -s "$CF_TOKEN_FILE" ]] ;;
+    3) return 0 ;;
+    4) [[ -x "$XRAY_BIN" ]] ;;
+    5) [[ -x "$SBOX_BIN" ]] ;;
+    6) [[ -x "$CFD_BIN" ]] ;;
+    7) [[ -s "$CERT_FULLCHAIN" && -s "$CERT_KEY" ]] ;;
+    8) [[ -n "$(stateGet uuid)" && -n "$(stateGet sub_token)" && -n "$(stateGet ipv4)" ]] ;;
+    9) have socat && [[ -x "$INSTALL_SH_DEST" ]] && systemctl list-unit-files "$UNIT_SUB" --no-legend 2>/dev/null | grep -q "$UNIT_SUB" && systemctl is-active --quiet "$UNIT_SUB" ;;
+    10) [[ -x "$CLI_PATH" && -x "$INSTALL_SH_DEST" ]] ;;
+    11) [[ -n "$(stateGet reality_privkey)" && -n "$(stateGet reality_shortid)" ]] ;;
+    12) [[ -n "$(stateGet reality_sni)" ]] ;;
+    13) [[ "$(jq -r '(.proto_enabled // [] | length) > 0' "$STATE_FILE" 2>/dev/null || echo false)" == "true" ]] ;;
+    14) [[ -n "$(stateGet cf_tunnel_id)" && -s "$CFD_TOKEN_FILE" ]] ;;
+    15) [[ -n "$(stateGet cf_tunnel_id)" ]] ;;
+    16)
+      local tok latest
+      tok=$(stateGet sub_token)
+      latest="${WEBROOT}/${tok}/latest"
+      [[ -n "$tok" && -d "$latest" && -s "${latest}/x-ray" && -s "${latest}/mihomo" && -s "${latest}/sing-box" ]]
+      ;;
+    17)
+      systemctl is-active --quiet "$UNIT_XRAY" && \
+      systemctl is-active --quiet "$UNIT_SBOX" && \
+      systemctl is-active --quiet "$UNIT_CFD" && \
+      systemctl is-active --quiet "$UNIT_SUB"
+      ;;
+    18) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 quickInstall() {
   banner "Quick install (one-click 18-step flow)"
   if ! confirm "Continue? This will affect iptables, systemd, and Cloudflare DNS/Tunnel"; then
@@ -6744,41 +6805,6 @@ quickInstall() {
   fi
   [[ -z "$step_start" || "$step_start" == "null" ]] && step_start=0
   local total=18
-
-  quickStepHealthy() {
-    local n=$1
-    case "$n" in
-      1) depsAllInstalled ;;
-      2) [[ -n "$(stateGet domain)" && -n "$(stateGet acme_email)" && -s "$CF_TOKEN_FILE" ]] ;;
-      3) return 0 ;;
-      4) [[ -x "$XRAY_BIN" ]] ;;
-      5) [[ -x "$SBOX_BIN" ]] ;;
-      6) [[ -x "$CFD_BIN" ]] ;;
-      7) [[ -s "$CERT_FULLCHAIN" && -s "$CERT_KEY" ]] ;;
-      8) [[ -n "$(stateGet uuid)" && -n "$(stateGet sub_token)" && -n "$(stateGet ipv4)" ]] ;;
-      9) have socat && [[ -x "$INSTALL_SH_DEST" ]] && systemctl list-unit-files "$UNIT_SUB" --no-legend 2>/dev/null | grep -q "$UNIT_SUB" && systemctl is-active --quiet "$UNIT_SUB" ;;
-      10) [[ -x "$CLI_PATH" && -x "$INSTALL_SH_DEST" ]] ;;
-      11) [[ -n "$(stateGet reality_privkey)" && -n "$(stateGet reality_shortid)" ]] ;;
-      12) [[ -n "$(stateGet reality_sni)" ]] ;;
-      13) [[ "$(jq -r '(.proto_enabled // [] | length) > 0' "$STATE_FILE" 2>/dev/null || echo false)" == "true" ]] ;;
-      14) [[ -n "$(stateGet cf_tunnel_id)" && -s "$CFD_TOKEN_FILE" ]] ;;
-      15) [[ -n "$(stateGet cf_tunnel_id)" ]] ;;
-      16)
-        local tok latest
-        tok=$(stateGet sub_token)
-        latest="${WEBROOT}/${tok}/latest"
-        [[ -n "$tok" && -d "$latest" && -s "${latest}/default" && -s "${latest}/mihomo" && -s "${latest}/mihomo-full" && -s "${latest}/sbox" ]]
-        ;;
-      17)
-        systemctl is-active --quiet "$UNIT_XRAY" && \
-        systemctl is-active --quiet "$UNIT_SBOX" && \
-        systemctl is-active --quiet "$UNIT_CFD" && \
-        systemctl is-active --quiet "$UNIT_SUB"
-        ;;
-      18) return 1 ;;
-      *) return 1 ;;
-    esac
-  }
 
   __qi_step() {
     local n=$1 title=$2 fn=$3
